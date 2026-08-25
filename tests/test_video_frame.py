@@ -33,9 +33,11 @@ class VideoFrameDataTests(unittest.TestCase):
         ui_source = inspect.getsource(SafeControlApp._build_ui)
         refresh_source = inspect.getsource(SafeControlApp._refresh_person_detection)
 
-        self.assertIn('text="刷新识别"', ui_source)
+        self.assertIn('text="刷新识别（F5）"', ui_source)
         self.assertIn("_refresh_person_detection", ui_source)
         self.assertIn("PERSON_BOX_RED", refresh_source)
+        self.assertIn("PERSON_BOX_GREEN", refresh_source)
+        self.assertIn("person_refresh_shortcut_var", ui_source)
 
     def test_camera_panel_uses_buttons_instead_of_person_status_text(self) -> None:
         ui_source = inspect.getsource(SafeControlApp._build_ui)

@@ -2,9 +2,11 @@ import tkinter as tk
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from go2_safe_control.app import SafeControlApp
+from go2_safe_control.person_detection import PERSON_BOX_GREEN, PERSON_BOX_RED
 from go2_safe_control.safety import Velocity
 from go2_safe_control.session import VideoFrameData
 from go2_safe_control.workflow import WorkflowStep
@@ -111,6 +113,57 @@ class WorkflowAppTests(unittest.TestCase):
         self.assertIn("人员识别已就绪", self.app.camera_var.get())
         self.assertIn("红色框", self.app.camera_var.get())
         self.assertNotIn("正在", self.app.camera_var.get())
+
+    def test_refresh_shortcut_defaults_to_f5_and_is_visible(self) -> None:
+        self.assertEqual(self.app.person_refresh_shortcut_var.get(), "F5")
+        self.assertEqual(
+            tuple(self.app.person_refresh_shortcut_box.cget("values")),
+            ("F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"),
+        )
+        self.assertIn("F5", self.app.person_refresh_button.cget("text"))
+
+    def test_refresh_shortcut_toggles_box_color_once_per_key_press(self) -> None:
+        self.app._camera_requested = True
+        self.app._person_detection.refresh = Mock()
+        event = SimpleNamespace(keysym="F5", keycode=116)
+
+        self.assertEqual(self.app._on_key_press(event), "break")
+        self.assertEqual(self.app._person_box_color, PERSON_BOX_RED)
+        self.assertEqual(self.app._on_key_press(event), "break")
+        self.assertEqual(self.app._person_box_color, PERSON_BOX_RED)
+        self.app._person_detection.refresh.assert_called_once_with()
+
+        self.assertEqual(self.app._on_key_release(event), "break")
+        self.assertEqual(self.app._on_key_press(event), "break")
+        self.assertEqual(self.app._person_box_color, PERSON_BOX_GREEN)
+        self.assertEqual(self.app._person_detection.refresh.call_count, 2)
+
+    def test_changing_refresh_shortcut_updates_button_and_key(self) -> None:
+        self.app._camera_requested = True
+        self.app._person_detection.refresh = Mock()
+        self.app.person_refresh_shortcut_var.set("F8")
+        self.app._on_refresh_shortcut_changed()
+
+        self.assertIn("F8", self.app.person_refresh_button.cget("text"))
+        self.assertIsNone(
+            self.app._on_key_press(SimpleNamespace(keysym="F5", keycode=116))
+        )
+        self.assertEqual(
+            self.app._on_key_press(SimpleNamespace(keysym="F8", keycode=119)),
+            "break",
+        )
+        self.app._person_detection.refresh.assert_called_once_with()
+
+    def test_refresh_shortcut_cannot_bypass_camera_requirement(self) -> None:
+        self.app._camera_requested = False
+        self.app._person_detection.refresh = Mock()
+
+        result = self.app._on_key_press(SimpleNamespace(keysym="F5", keycode=116))
+
+        self.assertEqual(result, "break")
+        self.assertEqual(self.app._person_box_color, PERSON_BOX_GREEN)
+        self.app._person_detection.refresh.assert_not_called()
+        self.assertIn("请先连接并开启摄像头", self.app.camera_var.get())
 
     def test_wait_only_workflow_completes_and_stops(self) -> None:
         self.app.workflow_steps = [WorkflowStep("wait", 0.0, 0.1)]

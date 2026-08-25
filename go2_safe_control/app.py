@@ -56,6 +56,7 @@ from .workflow import (
 
 # 以下大写名称是模块常量：运行中不会被随意修改的统一配置。
 CONTROL_KEYS = {"w", "a", "s", "d", "q", "e"}
+PERSON_REFRESH_SHORTCUTS = ("F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12")
 APP_TITLE = "宇树Go2机器狗远程二次开发与调试控制台"
 HEADER_FONT_SIZE = 20
 HEADER_HEIGHT = 68
@@ -279,9 +280,11 @@ class SafeControlApp:
         self._video_lock = threading.Lock()
         self._latest_video_frame: VideoFrameData | None = None
         self._camera_photo: tk.PhotoImage | None = None
-        # 人员识别在独立线程中运行；绿色是首次启动，手动刷新成功后改用红框。
+        # 人员识别在独立线程中运行；每次刷新都会在绿色框和红色框之间切换。
         self._person_box_color = PERSON_BOX_GREEN
         self._person_detection_enabled = False
+        # 集合用于屏蔽 Windows 按键连发：必须松开快捷键后才能再次切换颜色。
+        self._refresh_shortcuts_down: set[str] = set()
         self._person_detection = PersonDetectionWorker(
             default_model_path(),
             status_callback=self._queue_person_detection_event,
@@ -305,6 +308,7 @@ class SafeControlApp:
         self.arm_var = tk.StringVar(value="未武装：不会发送移动命令")
         self.walk_mode_var = tk.StringVar(value="行走模式未准备")
         self.camera_var = tk.StringVar(value="摄像头未开启")
+        self.person_refresh_shortcut_var = tk.StringVar(value="F5")
         self.error_summary_var = tk.StringVar(value="暂无错误；按钮校验和通信错误会显示在这里")
         self.workflow_status_var = tk.StringVar(value="流程未启动；可编辑下方步骤")
         self.header_activity_var = tk.StringVar(value="未连接 · 本地界面就绪")
@@ -737,11 +741,24 @@ class SafeControlApp:
         self.person_stop_button.pack(side="left", padx=(0, 8))
         self.person_refresh_button = ttk.Button(
             recognition_actions,
-            text="刷新识别",
+            text="刷新识别（F5）",
             command=self._refresh_person_detection,
             style="Secondary.TButton",
         )
-        self.person_refresh_button.pack(side="left")
+        self.person_refresh_button.pack(side="left", padx=(0, 12))
+        ttk.Label(recognition_actions, text="刷新快捷键").pack(side="left", padx=(0, 6))
+        self.person_refresh_shortcut_box = ttk.Combobox(
+            recognition_actions,
+            textvariable=self.person_refresh_shortcut_var,
+            values=PERSON_REFRESH_SHORTCUTS,
+            state="readonly",
+            width=5,
+        )
+        self.person_refresh_shortcut_box.pack(side="left")
+        self.person_refresh_shortcut_box.bind(
+            "<<ComboboxSelected>>",
+            self._on_refresh_shortcut_changed,
+        )
         ttk.Label(
             camera,
             textvariable=self.camera_var,
@@ -1632,6 +1649,18 @@ class SafeControlApp:
         self._last_control_state_signature = None
         self._sync_control_states()
 
+    def _on_refresh_shortcut_changed(self, _event: object = None) -> None:
+        """更新刷新按钮提示；快捷键只在本次程序运行期间有效。"""
+
+        shortcut = self.person_refresh_shortcut_var.get().upper()
+        if shortcut not in PERSON_REFRESH_SHORTCUTS:
+            shortcut = "F5"
+            self.person_refresh_shortcut_var.set(shortcut)
+        self._refresh_shortcuts_down.clear()
+        self.person_refresh_button.configure(text=f"刷新识别（{shortcut}）")
+        box_label = self._person_box_color_label()
+        self.camera_var.set(f"刷新快捷键已设为 {shortcut}；当前使用{box_label}")
+
     def _connect(self) -> None:
         """校验界面输入，清除旧运动状态，再请求通信层连接。"""
 
@@ -1804,11 +1833,12 @@ class SafeControlApp:
         self._sync_control_states()
 
     def _start_person_detection(self) -> None:
-        """允许后续摄像头帧进入 YOLO；首次开启沿用初始绿色框。"""
+        """允许后续摄像头帧进入 YOLO，并显示当前框颜色。"""
 
         self._person_detection_enabled = True
+        box_label = self._person_box_color_label()
         if self._camera_requested:
-            self.camera_var.set("摄像头已开启 · 人员识别已开启（绿色框）")
+            self.camera_var.set(f"摄像头已开启 · 人员识别已开启（{box_label}）")
         else:
             self.camera_var.set("人员识别已开启，等待摄像头画面")
         self._last_control_state_signature = None
@@ -1828,11 +1858,25 @@ class SafeControlApp:
         self._sync_control_states()
 
     def _refresh_person_detection(self) -> None:
-        """重新加载模型、清空旧框，并按用户要求切换为红色人员框。"""
+        """重新加载模型、清空旧框，并在红色和绿色人员框之间切换。"""
 
-        self._person_box_color = PERSON_BOX_RED
+        if not self.session.connected or not self._camera_requested:
+            shortcut = self.person_refresh_shortcut_var.get()
+            self.camera_var.set(f"{shortcut} 刷新不可用：请先连接并开启摄像头")
+            return
+        self._person_box_color = (
+            PERSON_BOX_GREEN
+            if self._person_box_color == PERSON_BOX_RED
+            else PERSON_BOX_RED
+        )
         self._person_detection.refresh()
-        self.camera_var.set("正在刷新人员识别模型；刷新后使用红色框")
+        box_label = self._person_box_color_label()
+        self.camera_var.set(f"正在刷新人员识别模型；刷新后使用{box_label}")
+
+    def _person_box_color_label(self) -> str:
+        """返回供界面显示的人员框颜色名称，避免只依赖颜色表达状态。"""
+
+        return "红色框" if self._person_box_color == PERSON_BOX_RED else "绿色框"
 
     # ==================== 人工输入和统一停止链 ====================
 
@@ -1853,6 +1897,12 @@ class SafeControlApp:
     def _on_key_press(self, event: tk.Event[tk.Misc]) -> str | None:
         """处理物理按键；返回 'break' 会阻止事件继续进入中文输入法。"""
 
+        keysym = str(event.keysym).upper()
+        if keysym == self.person_refresh_shortcut_var.get().upper():
+            if keysym not in self._refresh_shortcuts_down:
+                self._refresh_shortcuts_down.add(keysym)
+                self._refresh_person_detection()
+            return "break"
         if self._typing_in_field():
             return None
         key = control_key_from_event(event.keysym, event.keycode)
@@ -1866,6 +1916,10 @@ class SafeControlApp:
         return None
 
     def _on_key_release(self, event: tk.Event[tk.Misc]) -> str | None:
+        keysym = str(event.keysym).upper()
+        self._refresh_shortcuts_down.discard(keysym)
+        if keysym == self.person_refresh_shortcut_var.get().upper():
+            return "break"
         if self._typing_in_field():
             return None
         key = control_key_from_event(event.keysym, event.keycode)
@@ -2077,7 +2131,12 @@ class SafeControlApp:
         # 必须把 PhotoImage 保存在实例字段中，否则会被垃圾回收后画面消失。
         self._camera_photo = photo
         self.camera_label.configure(image=self._camera_photo, text="")
-        self.camera_var.set("摄像头画面接收正常（不保存）")
+        if self._person_detection_enabled:
+            self.camera_var.set(
+                f"摄像头画面接收正常 · 人员识别已开启（{self._person_box_color_label()}）"
+            )
+        else:
+            self.camera_var.set("摄像头画面接收正常（不保存）")
 
     def _queue_person_detection_event(self, kind: str, message: str) -> None:
         """把识别线程状态送回 Tkinter 主线程。"""
@@ -2093,7 +2152,7 @@ class SafeControlApp:
         if kind == "loading":
             self.camera_var.set(message)
         elif kind == "ready":
-            box_label = "红色框" if self._person_box_color == PERSON_BOX_RED else "绿色框"
+            box_label = self._person_box_color_label()
             if self._person_detection_enabled and self._camera_requested:
                 self.camera_var.set(f"摄像头已开启 · 人员识别已就绪（{box_label}）")
             elif self._person_detection_enabled:
