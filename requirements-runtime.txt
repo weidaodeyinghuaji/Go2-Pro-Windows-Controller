@@ -1,0 +1,11 @@
+aiortc>=1.9.0
+curl_cffi
+lz4
+numpy
+onnxruntime==1.28.0
+packaging
+Pillow==12.3.0
+pycryptodome
+requests
+sounddevice
+wasmtime

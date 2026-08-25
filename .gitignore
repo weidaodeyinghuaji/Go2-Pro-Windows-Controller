@@ -1,0 +1,16 @@
+.venv/
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+dist/
+build/
+*.zip

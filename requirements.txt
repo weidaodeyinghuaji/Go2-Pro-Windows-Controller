@@ -1,0 +1,3 @@
+unitree_webrtc_connect==2.1.2
+
+numpy
