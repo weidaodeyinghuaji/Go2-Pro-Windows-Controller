@@ -360,6 +360,35 @@ class RobotSessionProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("3203", events[-1][1])
         self.assertNotIn("error", [kind for kind, _message in events])
 
+    async def test_light_stops_motion_before_setting_head_led_and_reports_ack(self) -> None:
+        session, pub_sub = self.make_session([sport_response(), sport_response()])
+        events: list[tuple[str, str]] = []
+        session._on_event = lambda kind, message: events.append((kind, message))
+        with session._state_lock:
+            session._walk_ready = True
+            session._desired = Velocity(0.3, 0.0, 0.0)
+
+        await session._set_light("light_red_flash", 8, "request-1")
+
+        self.assertEqual(session._desired, Velocity.zero())
+        self.assertEqual(pub_sub.requests[0], ("rt/api/sport/request", {"api_id": 1003}))
+        self.assertEqual(pub_sub.requests[1], (
+            "rt/api/vui/request",
+            {"api_id": 1007, "parameter": {"color": "red", "time": 8, "flash_cycle": 1000}},
+        ))
+        self.assertEqual(events[-1], ("light_started", "request-1"))
+
+    async def test_rejected_light_does_not_report_success(self) -> None:
+        session, _pub_sub = self.make_session([sport_response(), sport_response(3203)])
+        events: list[tuple[str, str]] = []
+        session._on_event = lambda kind, message: events.append((kind, message))
+
+        await session._set_light("light_red", 5, "request-2")
+
+        self.assertEqual(events[-1][0], "light_error")
+        self.assertIn("request-2|", events[-1][1])
+        self.assertNotIn("light_started", [kind for kind, _message in events])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -114,6 +114,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(set(payload[0]), {"action", "speed", "duration"})
         self.assertEqual(ACTION_LABELS["stand_down"], "安全卧趴")
 
+    def test_sound_step_round_trip_uses_asset_id_not_absolute_path(self) -> None:
+        asset_id = "a" * 64
+        steps = parse_workflow([
+            {"action": "播放声音", "speed": "9", "duration": "1.5", "asset_id": asset_id}
+        ])
+        self.assertEqual(steps[0].speed, 0.0)
+        self.assertEqual(steps[0].asset_id, asset_id)
+        self.assertEqual(workflow_from_json(workflow_to_json(steps)), steps)
+        with self.assertRaisesRegex(ValueError, "选择声音库"):
+            parse_workflow([{"action": "播放声音", "duration": 1, "asset_id": "C:/sound.mp3"}])
+
     def test_additional_sport_actions_are_valid_timed_steps(self) -> None:
         actions = ["平衡站立", "跌倒恢复", "坐下", "坐起", "打招呼", "伸展", "比心"]
         steps = parse_workflow(
@@ -127,6 +138,26 @@ class WorkflowTests(unittest.TestCase):
             [{"action": "恢复站立", "speed": "", "duration": "3"}]
         )
         self.assertEqual(steps[0].action, "recovery_stand")
+
+    def test_light_steps_are_independent_of_sound_and_validate_on_time(self) -> None:
+        steps = parse_workflow([
+            {"action": "红灯闪烁", "speed": "9", "duration": "8"},
+            {"action": "绿灯", "speed": "", "duration": "3"},
+            {"action": "白灯", "speed": "", "duration": "2"},
+        ])
+        self.assertEqual([step.action for step in steps], ["light_red_flash", "light_green", "light_white"])
+        self.assertTrue(all(step.speed == 0.0 and not step.asset_id for step in steps))
+        self.assertEqual(workflow_from_json(workflow_to_json(steps)), steps)
+        with self.assertRaisesRegex(ValueError, "灯光时长"):
+            parse_workflow([{"action": "红灯", "duration": "0.5"}])
+
+    def test_light_step_can_complete_after_ack_without_waiting_for_lamp_expiry(self) -> None:
+        runner = WorkflowRunner()
+        runner.start([WorkflowStep("light_red", 0.0, 8.0), WorkflowStep("wait", 0.0, 1.0)])
+        runner.begin_current(now=10.0)
+        runner.complete_current()
+        self.assertEqual(runner.current_step.action, "wait")
+        self.assertTrue(runner.awaiting_begin)
 
 
 if __name__ == "__main__":

@@ -112,7 +112,7 @@ def prompt_password_gui(email: str) -> str | None:
     from tkinter import messagebox, ttk
 
     root = tk.Tk()
-    root.title("Go2 AES 密钥 - 输入 Unitree 密码")
+    root.title("AI故障预警｜设备 AES 密钥")
     root.geometry("500x250")
     root.resizable(False, False)
 

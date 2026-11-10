@@ -15,12 +15,14 @@ from __future__ import annotations
 
 # asyncio 负责在一个后台线程中调度连接、发命令、收视频等异步任务。
 import asyncio
+import hashlib
 import json
 import random
 # threading 用来把网络事件循环和 Tkinter 主线程隔离。
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 # 这是项目的第三方 WebRTC 依赖：提供主题表、连接对象和连接方式枚举。
@@ -44,6 +46,19 @@ from .protocol import (
     stop_options,
 )
 from .safety import Velocity, watchdog_velocity
+from .audio_playback import (
+    AUDIO_TOPIC,
+    audio_entries,
+    audio_options,
+    find_uploaded_uuid,
+    prepare_wav,
+    require_audio_success,
+    synced_audio_ids,
+    upload_blocks,
+    upload_name,
+)
+from .sound_library import Sound, robot_audio_name
+from .lighting import light_options, require_light_success
 
 
 # Literal 限制事件名称只能从下面几个字符串中选择，拼错时 PyCharm 会提醒。
@@ -58,13 +73,19 @@ EventKind = Literal[
     "walk_not_ready",
     "camera",
     "diagnostic",
+    "audio",
+    "audio_error",
+    "audio_catalog",
+    "audio_started",
+    "audio_sync_done",
+    "light_started",
+    "light_error",
 ]
 # Callable[[参数类型...], 返回类型] 用来描述“可被调用的回调函数”。
 EventCallback = Callable[[EventKind, str], None]
 VideoFrameCallback = Callable[["VideoFrameData"], None]
 # frozenset 是不可修改的集合；这两个固件模式都允许基础 Move/StopMove。
 WALK_READY_MODES = frozenset({"normal", "mcf"})
-
 
 @dataclass(frozen=True)
 class ConnectionSettings:
@@ -74,7 +95,6 @@ class ConnectionSettings:
     mode: Literal["AP", "STA"]
     ip: str = ""
     aes_key: str = ""
-
 
 @dataclass(frozen=True)
 class VideoFrameData:
@@ -98,6 +118,15 @@ class VideoFrameData:
         return f"P6\n{self.width} {self.height}\n255\n".encode("ascii") + self.rgb
 
 
+def video_processing_size(width: int, height: int, max_long_edge: int = 960) -> tuple[int, int]:
+    """保留摄像头原比例和站姿细节；只缩小过大的帧，不把 4:3 强拉成 16:9。"""
+
+    if width <= 0 or height <= 0 or max_long_edge <= 0:
+        raise ValueError("视频尺寸必须为正数")
+    scale = min(1.0, max_long_edge / max(width, height))
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
 class RobotSession:
     """管理后台 WebRTC 连接，并执行停止看门狗和动作串行化。"""
 
@@ -105,6 +134,8 @@ class RobotSession:
     CONTROL_PERIOD = 0.10
     WATCHDOG_TIMEOUT = 0.35
     REQUEST_TIMEOUT = 0.80
+    REQUEST_TIMEOUT_LONG = 5.0
+
     # 姿态动作可能在真正开始执行后才回复，不能沿用普通查询的 0.8 秒。
     ACTION_REQUEST_TIMEOUT = 5.0
 
@@ -147,6 +178,10 @@ class RobotSession:
         self._command_lock: asyncio.Lock | None = None
         self._action_lock: asyncio.Lock | None = None
         self._control_task: asyncio.Task[None] | None = None
+        self._audio_task: asyncio.Task[None] | None = None
+        self._audio_cache: dict[tuple[str, int, int], str] = {}
+        self._audio_remote: dict[str, str] = {}
+        self._audio_catalog_ready = False
 
     @property
     def connected(self) -> bool:
@@ -220,6 +255,40 @@ class RobotSession:
             self._safety_epoch += 1
         self._submit(self._sport_action(action))
 
+    def set_light(self, action: str, seconds: int, request_id: str) -> None:
+        """在同一 WebRTC 连接上异步设置头部灯；不触碰声音库。"""
+
+        light_options(action, seconds)  # 在界面线程先拒绝非法步骤。
+        with self._state_lock:
+            self._desired = Velocity.zero()
+            self._last_update = time.monotonic()
+            self._walk_ready = False
+            self._safety_epoch += 1
+        self._submit(self._set_light(action, seconds, request_id))
+
+    async def _set_light(self, action: str, seconds: int, request_id: str) -> None:
+        """先确认已停止运动，再发送 VUI 颜色命令并检查回执。"""
+
+        with self._state_lock:
+            self._desired = Velocity.zero()
+            self._walk_ready = False
+        try:
+            if not self.connected:
+                raise RuntimeError("连接已断开，无法设置灯光")
+            action_lock = self._action_lock
+            if action_lock is None:
+                raise RuntimeError("WebRTC 尚未连接")
+            async with action_lock:
+                if not await self._send_stop(retries=3):
+                    raise RuntimeError("停止命令未获确认，未发送灯光指令")
+                response = await self._send_request(
+                    RTC_TOPIC["VUI"], light_options(action, seconds), timeout=2.0
+                )
+                require_light_success(response)
+            self._emit("light_started", request_id)
+        except Exception as exc:
+            self._emit("light_error", f"{request_id}|{type(exc).__name__}: {exc}")
+
     def start_video(self) -> None:
         """异步请求开启只读摄像头通道。"""
 
@@ -227,6 +296,180 @@ class RobotSession:
 
     def stop_video(self) -> None:
         self._submit(self._stop_video())
+
+    def play_audio(self, path: Path) -> None:
+        """通过机器狗扬声器播放本地 MP3/WAV；解码和网络上传都不阻塞界面。"""
+
+        self._submit(self._play_audio(path))
+
+    def stop_audio(self) -> None:
+        """取消尚未完成的上传，并暂停机器狗当前播放的音频。"""
+
+        self._submit(self._stop_audio())
+
+    @property
+    def audio_catalog_ready(self) -> bool:
+        with self._state_lock:
+            return self._audio_catalog_ready
+
+    def has_synced_audio(self, asset_id: str) -> bool:
+        with self._state_lock:
+            return self._audio_catalog_ready and asset_id[:24] in self._audio_remote
+
+    def refresh_audio_catalog(self) -> None:
+        self._submit(self._refresh_audio_catalog())
+
+    async def _refresh_audio_catalog(self) -> None:
+        if self._conn is None:
+            return
+        try:
+            response = await self._send_request(
+                AUDIO_TOPIC, audio_options("GET_AUDIO_LIST", {}), timeout=5.0
+            )
+            remote = synced_audio_ids(audio_entries(response))
+            with self._state_lock:
+                self._audio_remote = remote
+                self._audio_catalog_ready = True
+            self._emit("audio_catalog", f"已核对机器狗声音库：{len(remote)} 个已同步声音")
+        except Exception as exc:
+            with self._state_lock:
+                self._audio_remote = {}
+                self._audio_catalog_ready = False
+            self._emit("audio_error", f"查询机器狗声音库失败：{type(exc).__name__}: {exc}")
+
+    def sync_sounds(self, sounds: list[Sound]) -> None:
+        """只上传机器人列表中缺失的声音；自动流程不会调用此方法。"""
+
+        self._submit(self._sync_sounds(sounds))
+
+    async def _sync_sounds(self, sounds: list[Sound]) -> None:
+        task = asyncio.current_task()
+        if not self.connected:
+            self._emit("audio_error", "尚未连接机器狗，不能同步声音库")
+            return
+        if self._audio_task is not None and not self._audio_task.done():
+            self._emit("audio_error", "另一个声音操作尚未完成")
+            return
+        self._audio_task = task
+        try:
+            await self._refresh_audio_catalog()
+            if not self.audio_catalog_ready:
+                return
+            missing = [sound for sound in sounds if not self.has_synced_audio(sound.asset_id)]
+            for position, sound in enumerate(missing, 1):
+                wav_data = await asyncio.to_thread(sound.path.read_bytes)
+                if hashlib.sha256(wav_data).hexdigest() != sound.asset_id:
+                    raise ValueError(f"声音素材校验失败：{sound.name}")
+                name = robot_audio_name(sound.asset_id)
+                blocks = list(upload_blocks(wav_data, name))
+                for index, block in enumerate(blocks, 1):
+                    await self._audio_request("UPLOAD_AUDIO_FILE", block)
+                    if index == len(blocks) or index % max(1, len(blocks) // 10) == 0:
+                        self._emit("audio", f"同步 {position}/{len(missing)}：{sound.name}（{index}/{len(blocks)}）")
+                # 最后一个上传块回复后，AudioHub 索引可能稍晚才出现。
+                for attempt in range(10):
+                    if attempt:
+                        await asyncio.sleep(0.3)
+                    await self._refresh_audio_catalog()
+                    if self.has_synced_audio(sound.asset_id):
+                        break
+                else:
+                    raise RuntimeError(f"机器人没有确认已保存声音：{sound.name}")
+            self._emit("audio_sync_done", f"声音库同步完成：新增 {len(missing)} 个，已有 {len(sounds) - len(missing)} 个")
+        except asyncio.CancelledError:
+            self._emit("audio", "声音库同步已取消")
+        except Exception as exc:
+            self._emit("audio_error", f"同步声音库失败：{type(exc).__name__}: {exc}")
+        finally:
+            if self._audio_task is task:
+                self._audio_task = None
+
+    def play_synced_audio(self, asset_id: str) -> None:
+        self._submit(self._play_synced_audio(asset_id))
+
+    async def _play_synced_audio(self, asset_id: str) -> None:
+        task = asyncio.current_task()
+        if self._audio_task is not None and not self._audio_task.done():
+            self._emit("audio_error", "另一个声音操作尚未完成")
+            return
+        with self._state_lock:
+            unique_id = self._audio_remote.get(asset_id[:24]) if self._audio_catalog_ready else None
+        if not self.connected or not unique_id:
+            self._emit("audio_error", "这个声音尚未同步到当前机器狗；请先同步声音库")
+            return
+        self._audio_task = task
+        try:
+            await self._audio_request("SET_PLAY_MODE", {"play_mode": "no_cycle"})
+            await self._audio_request("SELECT_START_PLAY", {"unique_id": unique_id})
+            self._emit("audio_started", asset_id)
+        except asyncio.CancelledError:
+            self._emit("audio", "声音播放已取消")
+        except Exception as exc:
+            self._emit("audio_error", f"播放声音失败：{type(exc).__name__}: {exc}")
+        finally:
+            if self._audio_task is task:
+                self._audio_task = None
+
+    async def _audio_request(
+        self, api_name: str, parameters: dict[str, object], timeout: float = 3.0
+    ) -> dict[str, Any]:
+        response = await self._send_request(
+            AUDIO_TOPIC, audio_options(api_name, parameters), timeout=timeout
+        )
+        return require_audio_success(response, api_name)
+
+    async def _play_audio(self, path: Path) -> None:
+        task = asyncio.current_task()
+        if not self.connected:
+            self._emit("audio_error", "尚未连接机器狗，不能播放音频")
+            return
+        if self._audio_task is not None and not self._audio_task.done():
+            self._emit("audio_error", "已有音频正在准备或播放；请先点“停止声音”")
+            return
+        self._audio_task = task
+        try:
+            stat = path.stat()
+            cache_key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+            unique_id = self._audio_cache.get(cache_key)
+            if unique_id is None:
+                self._emit("audio", f"正在转换音频：{path.name}")
+                wav_data = await asyncio.to_thread(prepare_wav, path)
+                name = upload_name()
+                blocks = list(upload_blocks(wav_data, name))
+                self._emit("audio", f"正在上传至机器狗：0/{len(blocks)}")
+                for index, block in enumerate(blocks, 1):
+                    await self._audio_request("UPLOAD_AUDIO_FILE", block)
+                    if index == len(blocks) or index % max(1, len(blocks) // 10) == 0:
+                        self._emit("audio", f"正在上传至机器狗：{index}/{len(blocks)}")
+                response = await self._send_request(
+                    AUDIO_TOPIC, audio_options("GET_AUDIO_LIST", {}), timeout=5.0
+                )
+                unique_id = find_uploaded_uuid(audio_entries(response), name)
+                self._audio_cache[cache_key] = unique_id
+            await self._audio_request("SET_PLAY_MODE", {"play_mode": "no_cycle"})
+            await self._audio_request("SELECT_START_PLAY", {"unique_id": unique_id})
+            self._emit("audio", f"机器狗正在播放：{path.name}")
+        except asyncio.CancelledError:
+            self._emit("audio", "音频上传或播放已取消")
+        except Exception as exc:
+            self._emit("audio_error", f"音频播放失败：{type(exc).__name__}: {exc}")
+        finally:
+            if self._audio_task is task:
+                self._audio_task = None
+
+    async def _stop_audio(self) -> None:
+        task = self._audio_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._conn is None:
+            self._emit("audio", "声音已停止")
+            return
+        try:
+            await self._audio_request("PAUSE", {})
+            self._emit("audio", "声音已停止")
+        except Exception as exc:
+            self._emit("audio_error", f"停止声音未获确认：{type(exc).__name__}: {exc}")
 
     def emergency_stop(self) -> None:
         """立即在本地清零并使准备状态失效，同时最多重试三次 StopMove。"""
@@ -322,6 +565,10 @@ class RobotSession:
             raise
 
         self._conn = conn
+        self._audio_cache.clear()
+        with self._state_lock:
+            self._audio_remote = {}
+            self._audio_catalog_ready = False
         self._command_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         with self._state_lock:
@@ -334,6 +581,7 @@ class RobotSession:
         self._control_task = asyncio.create_task(self._control_loop())
         target = "Go2 热点" if settings.mode == "AP" else settings.ip
         self._emit("connected", f"已连接：{settings.mode} / {target}")
+        asyncio.create_task(self._refresh_audio_catalog())
         if settings.mode == "AP":
             self._emit("diagnostic", "[AP] WebRTC 连接成功；等待准备行走模式")
         self._emit("walk_not_ready", "已连接；请先执行“准备行走模式”。")
@@ -344,6 +592,14 @@ class RobotSession:
         with self._state_lock:
             self._safety_epoch += 1
         conn = self._conn
+        audio_task = self._audio_task
+        if audio_task is not None and audio_task is not asyncio.current_task() and not audio_task.done():
+            audio_task.cancel()
+            await asyncio.gather(audio_task, return_exceptions=True)
+        self._audio_cache.clear()
+        with self._state_lock:
+            self._audio_remote = {}
+            self._audio_catalog_ready = False
         if conn is None:
             with self._state_lock:
                 self._connected = False
@@ -679,7 +935,7 @@ class RobotSession:
             self._emit("camera", "摄像头预览已关闭。")
 
     async def _receive_video(self, track: Any) -> None:
-        """持续接收视频帧，统一缩放为 480×270 RGB 后交给 GUI。"""
+        """持续接收视频帧；保留足够分辨率供站姿识别，GUI 再单独缩放预览。"""
 
         try:
             while self.connected:
@@ -687,12 +943,13 @@ class RobotSession:
                     await asyncio.sleep(0.05)
                     continue
                 frame = await track.recv()
-                # reformat 同时完成尺寸调整和像素格式转换。
-                scaled = frame.reformat(width=480, height=270, format="rgb24")
+                # 480×270 会丢失膝/踝关键点，且强行改变非 16:9 画面的形状。
+                width, height = video_processing_size(frame.width, frame.height)
+                scaled = frame.reformat(width=width, height=height, format="rgb24")
                 rgb = scaled.to_ndarray().tobytes()
                 callback = self._on_video_frame
                 if callback is not None:
-                    callback(VideoFrameData(480, 270, rgb))
+                    callback(VideoFrameData(width, height, rgb))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -12,9 +12,33 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = PROJECT_ROOT / "scripts" / "install.ps1"
 PACKAGER = PROJECT_ROOT / "scripts" / "build_share.ps1"
+STANDALONE_BUILDER = PROJECT_ROOT / "scripts" / "build_standalone.ps1"
+STANDALONE_SPEC = PROJECT_ROOT / "packaging" / "go2_controller.spec"
 
 
 class PortableDistributionTests(unittest.TestCase):
+    def test_standalone_release_is_self_contained_and_has_one_launcher(self) -> None:
+        builder = STANDALONE_BUILDER.read_text(encoding="utf-8")
+        spec = STANDALONE_SPEC.read_text(encoding="utf-8")
+
+        self.assertIn("$LauncherName", builder)
+        self.assertIn("[char]0x4E00", builder)
+        self.assertIn('"Go2 Controller.exe"', builder)
+        self.assertIn('"_internal"', builder)
+        self.assertIn('"unitree_webrtc_connect"', spec)
+        self.assertIn('"onnxruntime"', spec)
+        self.assertIn('"mediapipe"', spec)
+        self.assertIn('"av"', spec)
+        self.assertIn('"models" / "yolox_tiny.onnx"', spec)
+        self.assertIn('"models" / "pose_landmarker_lite.task"', spec)
+        self.assertIn('"fixtures" / "standing_person_cc0.jpg"', spec)
+        self.assertIn('"assets" / "ui"', spec)
+        self.assertIn('"app_icon.ico"', spec)
+        # 冻结版的 MediaPipe 会经 matplotlib/pyparsing.testing 导入 unittest。
+        self.assertNotIn('excludes=["pytest", "unittest"', spec)
+        self.assertIn('--check-person-runtime', builder)
+        self.assertIn('standing=', builder)
+
     def test_installer_keeps_a_working_venv_created_in_the_same_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

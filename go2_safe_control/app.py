@@ -22,9 +22,11 @@ import os
 import re
 import threading
 import time
+import traceback
 # Tkinter 是 Python 自带 GUI 库；tk 是常用短别名。
 import tkinter as tk
 import unicodedata
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 # filedialog=文件选择框，messagebox=提示框，ttk=较现代的控件外观。
@@ -36,12 +38,26 @@ from .person_detection import (
     PersonDetectionWorker,
     default_model_path,
     draw_person_boxes,
+    split_person_boxes_by_color,
 )
 from .safety import ControlLimits, DeadmanKeys, SafetyPolicy, Velocity
 from .session import ConnectionSettings, EventKind, RobotSession, VideoFrameData
+from .sound_library import SoundLibrary
+from .video_recording import VideoRecorder
 from .windows_input import WindowsControlInputGuard
+from .ui_assets import UiAssetLibrary
+from .ui_theme import (
+    COLORS,
+    MOTION_DURATION_MS,
+    UI_FONT,
+    UI_MONO_FONT,
+    animate_window_fade_in,
+    configure_ui_styles,
+    ease_out_cubic,
+)
 from .workflow import (
     ACTION_LABELS,
+    LIGHT_ACTIONS,
     SPORT_ACTIONS,
     MOTION_ACTIONS,
     WorkflowRunner,
@@ -56,13 +72,12 @@ from .workflow import (
 
 # 以下大写名称是模块常量：运行中不会被随意修改的统一配置。
 CONTROL_KEYS = {"w", "a", "s", "d", "q", "e"}
-PERSON_REFRESH_SHORTCUTS = ("F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12")
-APP_TITLE = "宇树Go2机器狗远程二次开发与调试控制台"
+RECORD_SHORTCUT_LABEL = "Ctrl+R"
+APP_TITLE = "AI故障预警｜升压站智能巡检平台"
 HEADER_FONT_SIZE = 20
 HEADER_HEIGHT = 68
 CAMERA_PANEL_HEIGHT = 390
-# 通信层输出正好是 480×270。这里必须允许 480；若写成 470，整数缩放会把
-# 只超出 10px 的画面直接缩成 240×135，看起来就像没有铺满预览框。
+# 较旧/低分辨率的视频流可能只有 480×270；预览仍需正确填充可用区域。
 CAMERA_PREVIEW_MAX_WIDTH = 480
 CAMERA_PREVIEW_MAX_HEIGHT = 270
 LINEAR_SPEED_RANGE = (0.05, 0.80)
@@ -72,14 +87,8 @@ WINDOW_MAX_WIDTH = 1080
 WINDOW_MAX_HEIGHT = 720
 WINDOW_MARGIN_X = 80
 WINDOW_MARGIN_Y = 100
-# 保持 Windows 原生浅色界面；只保留安全相关按钮原有的红色和橙色语义。
-UI_BG = "SystemButtonFace"
-UI_DANGER = "#C00000"
-UI_WARNING = "#F0A000"
-UI_TEXT = "SystemWindowText"
-UI_MUTED = "#555555"
-UI_FONT = "Microsoft YaHei UI"
-UI_MONO_FONT = "Consolas"
+# 界面颜色集中定义在 ui_theme.py；画布背景使用同一设计令牌。
+UI_BG = COLORS.background
 # Windows 物理键码映射。即使中文输入法把 keysym 变成中文，也能认出实体 W 键。
 PHYSICAL_KEYCODES = {
     32: "space",
@@ -111,6 +120,23 @@ def camera_subsample_factor(width: int, height: int) -> int:
         1,
         math.ceil(width / CAMERA_PREVIEW_MAX_WIDTH),
         math.ceil(height / CAMERA_PREVIEW_MAX_HEIGHT),
+    )
+
+
+def fit_camera_preview_size(
+    frame_width: int,
+    frame_height: int,
+    area_width: int,
+    area_height: int,
+) -> tuple[int, int]:
+    """在不裁切、不变形的前提下，让视频尽量铺满当前预览区域。"""
+
+    if min(frame_width, frame_height, area_width, area_height) <= 0:
+        raise ValueError("视频帧和预览区域尺寸必须为正数。")
+    scale = min(area_width / frame_width, area_height / frame_height)
+    return (
+        max(1, round(frame_width * scale)),
+        max(1, round(frame_height * scale)),
     )
 
 
@@ -252,6 +278,12 @@ class SafeControlApp:
         )
         self.root.minsize(min(860, window_width), min(540, window_height))
         self._configure_styles()
+        self.ui_assets = UiAssetLibrary(self.root)
+        self._app_icon = self.ui_assets.app_icon()
+        self.root.iconphoto(True, self._app_icon)
+        self._header_background_photo: tk.PhotoImage | None = None
+        self._page_background_photo: tk.PhotoImage | None = None
+        self._tab_background_photos: dict[str, tk.PhotoImage] = {}
 
         # ---------- 纯逻辑状态：它们不直接画界面，也不直接连机器人 ----------
         self.policy = SafetyPolicy(ControlLimits())
@@ -264,15 +296,22 @@ class SafeControlApp:
         self.workflow_steps = default_workflow()
         self._workflow_preparing = False
         self._workflow_resume_after = 0.0
-        self._animation_frame = 0
-        self._last_animation_at = 0.0
         self._motion_buttons: dict[str, ttk.Button] = {}
         self._sport_action_buttons: dict[str, ttk.Button] = {}
         self._workflow_edit_buttons: list[ttk.Button] = []
         self._workflow_file_buttons: list[ttk.Button] = []
         self._speed_inputs: list[ttk.Spinbox] = []
         self._connection_details_visible = True
+        self._connection_animation_id: str | None = None
+        self._ui_after_ids: set[str] = set()
         self._camera_requested = False
+        self._audio_file: Path | None = None
+        self._selected_audio_id = ""
+        self._audio_busy = False
+        self._workflow_audio_pending = False
+        self._workflow_light_pending_id: str | None = None
+        self._workflow_light_deadline = 0.0
+        self._workflow_light_serial = 0
         self._activity_busy = False
         self._last_control_state_signature: tuple[object, ...] | None = None
         self.last_velocity = Velocity.zero()
@@ -280,7 +319,7 @@ class SafeControlApp:
         self._video_lock = threading.Lock()
         self._latest_video_frame: VideoFrameData | None = None
         self._camera_photo: tk.PhotoImage | None = None
-        # 人员识别在独立线程中运行；每次刷新都会在绿色框和红色框之间切换。
+        # 人员识别在独立线程中运行；刷新到红色模式后只显示最高置信度站立人员。
         self._person_box_color = PERSON_BOX_GREEN
         self._person_detection_enabled = False
         # 集合用于屏蔽 Windows 按键连发：必须松开快捷键后才能再次切换颜色。
@@ -289,8 +328,16 @@ class SafeControlApp:
             default_model_path(),
             status_callback=self._queue_person_detection_event,
         )
+        # 录制器只接收界面最终显示的帧，编码和写盘放在后台线程，避免卡住 GUI。
+        self._video_recorder = VideoRecorder(self._queue_recording_event)
+        self._record_shortcut_down = False
+        videos_directory = Path.home() / "Videos"
+        self._last_recording_directory = (
+            videos_directory if videos_directory.is_dir() else Path.home()
+        )
         # 错误同时显示在界面并追加到用户目录，方便没有开发环境时排查问题。
         local_app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+        self.sound_library = SoundLibrary(local_app_data / "Go2 Controller" / "audio")
         self._error_log_path = local_app_data / "Go2 Controller" / "logs" / "error.log"
         self._error_log_entries: list[str] = []
         self._last_error_signature: tuple[str, str] | None = None
@@ -308,13 +355,15 @@ class SafeControlApp:
         self.arm_var = tk.StringVar(value="未武装：不会发送移动命令")
         self.walk_mode_var = tk.StringVar(value="行走模式未准备")
         self.camera_var = tk.StringVar(value="摄像头未开启")
-        self.person_refresh_shortcut_var = tk.StringVar(value="F5")
+        self.audio_var = tk.StringVar(value="未选择声音文件 · 支持 MP3 / WAV（转换后不超过 10 MB）")
+        self.audio_choice_var = tk.StringVar()
+        self.recording_var = tk.StringVar(value=f"未录制 · 快捷键 {RECORD_SHORTCUT_LABEL}")
         self.error_summary_var = tk.StringVar(value="暂无错误；按钮校验和通信错误会显示在这里")
         self.workflow_status_var = tk.StringVar(value="流程未启动；可编辑下方步骤")
-        self.header_activity_var = tk.StringVar(value="未连接 · 本地界面就绪")
         self.workflow_action_var = tk.StringVar(value="前进")
         self.workflow_speed_var = tk.StringVar(value="0.30")
         self.workflow_duration_var = tk.StringVar(value="2.00")
+        self.workflow_sound_var = tk.StringVar()
         self.velocity_var = tk.StringVar(value="x=0.00  y=0.00  z=0.00")
         self.linear_speed_var = tk.StringVar(value=f"{self.policy.limits.linear:.2f}")
         self.lateral_speed_var = tk.StringVar(value=f"{self.policy.limits.lateral:.2f}")
@@ -322,79 +371,19 @@ class SafeControlApp:
 
         # 创建控件、监听 AES 输入变化、绑定键盘/关闭事件，然后启动 50ms 心跳。
         self._build_ui()
+        animate_window_fade_in(self.root)
         self.aes_var.trace_add("write", self._update_aes_hint)
         self._bind_events()
         self._tick()
 
     def _configure_styles(self) -> None:
-        """保留 Windows 原生浅色主题，只统一字体、间距和安全按钮。"""
+        """加载项目自己的浅色设计令牌与控件状态样式。"""
 
-        self.root.configure(background=UI_BG)
-        style = ttk.Style(self.root)
-        # 不切换 clam/第三方主题，让每台 Windows 使用原本熟悉的系统控件颜色。
-        style.configure(".", font=(UI_FONT, 10))
-        style.configure("App.TFrame")
-        style.configure("Surface.TFrame")
-        style.configure("Raised.TFrame")
-        style.configure("Panel.TLabelframe")
-        style.configure(
-            "Panel.TLabelframe.Label",
-            font=(UI_FONT, 11, "bold"),
-            padding=(4, 0),
-        )
-        style.configure("Muted.TLabel", foreground=UI_MUTED)
-        style.configure(
-            "HeaderTitle.TLabel",
-            font=(UI_FONT, HEADER_FONT_SIZE, "bold"),
-        )
-        style.configure(
-            "HeaderMeta.TLabel",
-            font=(UI_MONO_FONT, 10, "bold"),
-        )
-        style.configure(
-            "Telemetry.TLabel",
-            font=(UI_MONO_FONT, 12, "bold"),
-            padding=(10, 7),
-            relief="sunken",
-        )
-        style.configure("Status.TLabel", padding=(10, 7), relief="groove")
-        style.configure("Camera.TLabel", padding=8, relief="sunken", anchor="center")
-        style.configure("DangerText.TLabel", foreground=UI_DANGER)
-        style.configure("Path.TLabel", foreground=UI_MUTED)
-        style.configure("TEntry", padding=6)
-        style.configure("TCombobox", padding=5)
-        style.configure("TSpinbox", padding=4)
-        style.configure("TCheckbutton", padding=5)
-
-        for name in ("Primary.TButton", "Secondary.TButton", "Motion.TButton"):
-            style.configure(name, padding=(13, 8), font=(UI_FONT, 10, "bold"))
-        style.configure(
-            "Warning.TButton",
-            background=UI_WARNING,
-            foreground="black",
-            padding=(13, 8),
-            font=(UI_FONT, 10, "bold"),
-        )
-        style.map("Warning.TButton", background=[("active", "#FFB52E")])
-        style.configure(
-            "Danger.TButton",
-            background=UI_DANGER,
-            foreground="white",
-            padding=(13, 8),
-            font=(UI_FONT, 10, "bold"),
-        )
-        style.map("Danger.TButton", background=[("active", "#D82727")])
-        style.configure("Treeview", rowheight=28)
-        style.configure(
-            "Treeview.Heading",
-            font=(UI_FONT, 10, "bold"),
-            padding=(6, 7),
-        )
+        configure_ui_styles(self.root, header_font_size=HEADER_FONT_SIZE)
 
     def _build_ui(self) -> None:
         """创建并排版全部 Tkinter 控件；这里主要是界面结构，不发送机器人命令。"""
 
-        """创建窗口中的全部区域和控件；这里只定义布局，不连接机器人。"""
         page = ttk.Frame(self.root, style="App.TFrame")
         page.pack(fill="both", expand=True)
         self.page_scrollbar = ttk.Scrollbar(page, orient="vertical")
@@ -409,70 +398,144 @@ class SafeControlApp:
         self.page_canvas.pack(side="left", fill="both", expand=True)
         self.page_scrollbar.configure(command=self.page_canvas.yview)
 
-        container = ttk.Frame(self.page_canvas, padding=10, style="App.TFrame")
+        container = ttk.Frame(self.page_canvas, padding=14, style="App.TFrame")
         self._page_window = self.page_canvas.create_window(
             (0, 0),
             window=container,
             anchor="nw",
         )
+        self.page_background_label = tk.Label(
+            container,
+            borderwidth=0,
+            highlightthickness=0,
+            background=UI_BG,
+        )
+        self.page_background_label.place(x=0, y=0, relwidth=1, relheight=1)
+        self.page_background_label.lower()
         container.bind("<Configure>", self._update_page_scrollregion)
+        container.bind("<Configure>", self._resize_page_background, add="+")
         self.page_canvas.bind("<Configure>", self._resize_page_width)
         self.root.bind("<MouseWheel>", self._scroll_page, add="+")
 
-        header = ttk.Frame(container, height=HEADER_HEIGHT, padding=(8, 6), style="Surface.TFrame")
-        header.pack(fill="x", pady=(0, 8))
-        header.pack_propagate(False)
-        title_block = ttk.Frame(header, style="Surface.TFrame")
-        title_block.pack(side="left", fill="both", expand=True)
-        ttk.Label(
-            title_block,
+        self.header_canvas = tk.Canvas(
+            container,
+            height=HEADER_HEIGHT,
+            highlightthickness=1,
+            highlightbackground=COLORS.border,
+            borderwidth=0,
+            background=COLORS.surface_subtle,
+        )
+        self.header_canvas.pack(fill="x", pady=(0, 12))
+        self.header_canvas.pack_propagate(False)
+        self._header_background_item = self.header_canvas.create_image(
+            0,
+            0,
+            anchor="nw",
+        )
+        self.header_canvas.create_rectangle(
+            0,
+            0,
+            4,
+            HEADER_HEIGHT,
+            fill=COLORS.primary,
+            outline="",
+        )
+        self.header_canvas.create_text(
+            20,
+            HEADER_HEIGHT // 2,
             text=APP_TITLE,
-            style="HeaderTitle.TLabel",
+            fill=COLORS.text,
+            font=(UI_FONT, HEADER_FONT_SIZE, "bold"),
             anchor="w",
-        ).pack(anchor="w")
-        ttk.Label(
-            title_block,
-            textvariable=self.header_activity_var,
-            style="HeaderMeta.TLabel",
-            justify="left",
-        ).pack(anchor="w", pady=(3, 0))
-        self.emergency_button = tk.Button(
-            header,
+        )
+        self.emergency_button = ttk.Button(
+            self.header_canvas,
             text="紧急停止（空格）",
             command=self._emergency_stop,
-            background=UI_DANGER,
-            foreground="white",
-            activebackground="#D82727",
-            activeforeground="white",
-            font=(UI_FONT, 10, "bold"),
-            relief="raised",
-            padx=18,
-            pady=6,
+            style="Danger.TButton",
+            image=self.ui_assets.icon("emergency", size=20),
+            compound="left",
         )
-        self.emergency_button.pack(side="right", padx=(12, 0))
+        self._emergency_window = self.header_canvas.create_window(
+            0,
+            HEADER_HEIGHT // 2,
+            window=self.emergency_button,
+            anchor="e",
+        )
         self.activity_progress = ttk.Progressbar(
-            header,
+            self.header_canvas,
             mode="indeterminate",
             length=84,
+            style="Header.Horizontal.TProgressbar",
         )
-        self.activity_progress.pack(side="right")
+        self._activity_progress_window = self.header_canvas.create_window(
+            0,
+            HEADER_HEIGHT // 2,
+            window=self.activity_progress,
+            anchor="e",
+            state="hidden",
+        )
+        self.header_canvas.bind("<Configure>", self._resize_header_art)
 
         connection_slot = ttk.Frame(container, style="App.TFrame")
-        connection_slot.pack(fill="x", pady=(0, 8))
+        connection_slot.pack(fill="x", pady=(0, 12))
+        self.connection_slot = connection_slot
         workspace = ttk.Frame(container, style="App.TFrame")
         workspace.pack(fill="both", expand=True)
-        self.main_tabs = ttk.Notebook(workspace, height=500)
+        self.main_tabs = ttk.Notebook(workspace, height=500, style="Workspace.TNotebook")
         self.main_tabs.pack(fill="both", expand=True)
-        safety = ttk.Frame(self.main_tabs, padding=12)
-        controls = ttk.Frame(self.main_tabs, padding=12)
-        camera = ttk.Frame(self.main_tabs, padding=12)
-        workflow = ttk.Frame(self.main_tabs, padding=12)
-        error_log = ttk.Frame(self.main_tabs, padding=12)
-        self.main_tabs.add(safety, text="安全与姿态")
-        self.main_tabs.add(controls, text="运动控制")
-        self.main_tabs.add(camera, text="摄像头与识别")
-        self.main_tabs.add(workflow, text="自动流程")
-        self.main_tabs.add(error_log, text="错误日志")
+        safety = ttk.Frame(self.main_tabs, padding=16, style="Surface.TFrame")
+        controls = ttk.Frame(self.main_tabs, padding=16, style="Surface.TFrame")
+        camera = ttk.Frame(self.main_tabs, padding=16, style="Surface.TFrame")
+        workflow = ttk.Frame(self.main_tabs, padding=16, style="Surface.TFrame")
+        error_log = ttk.Frame(self.main_tabs, padding=16, style="Surface.TFrame")
+        for tab in (safety, controls, camera, workflow, error_log):
+            background_label = tk.Label(
+                tab,
+                borderwidth=0,
+                highlightthickness=0,
+                background=UI_BG,
+            )
+            background_label.place(x=0, y=0, relwidth=1, relheight=1)
+            background_label.lower()
+            tab.bind(
+                "<Configure>",
+                lambda event, label=background_label: self._resize_tab_background(
+                    event,
+                    label,
+                ),
+                add="+",
+            )
+        self.main_tabs.add(
+            safety,
+            text="安全与姿态",
+            image=self.ui_assets.icon("stand", size=18),
+            compound="left",
+        )
+        self.main_tabs.add(
+            controls,
+            text="运动控制",
+            image=self.ui_assets.icon("motion", size=18),
+            compound="left",
+        )
+        self.main_tabs.add(
+            camera,
+            text="摄像头与识别",
+            image=self.ui_assets.icon("camera", size=18),
+            compound="left",
+        )
+        self.main_tabs.add(
+            workflow,
+            text="自动流程",
+            image=self.ui_assets.icon("workflow", size=18),
+            compound="left",
+        )
+        self.main_tabs.add(
+            error_log,
+            text="错误日志",
+            image=self.ui_assets.icon("error_log", size=18),
+            compound="left",
+        )
         self.main_tabs.bind("<<NotebookTabChanged>>", self._resize_active_tab)
 
         connection = ttk.LabelFrame(
@@ -494,7 +557,9 @@ class SafeControlApp:
             summary,
             text="收起连接设置",
             command=self._toggle_connection_details,
-            style="Secondary.TButton",
+            style="Toolbar.TButton",
+            image=self.ui_assets.icon("settings"),
+            compound="left",
         )
         self.connection_toggle_button.pack(side="right", padx=(8, 0))
         self.disconnect_button = ttk.Button(
@@ -502,6 +567,8 @@ class SafeControlApp:
             text="断开并停止",
             command=self._disconnect,
             style="Secondary.TButton",
+            image=self.ui_assets.icon("disconnect"),
+            compound="left",
         )
         self.disconnect_button.pack(side="right", padx=(8, 0))
         self.connect_button = ttk.Button(
@@ -509,11 +576,20 @@ class SafeControlApp:
             text="建立连接",
             command=self._connect,
             style="Primary.TButton",
+            image=self.ui_assets.icon("connect"),
+            compound="left",
         )
         self.connect_button.pack(side="right", padx=(8, 0))
 
-        self.connection_details = ttk.Frame(connection, padding=(0, 10, 0, 0))
-        self.connection_details.grid(row=1, column=0, sticky="ew")
+        self.connection_details_host = ttk.Frame(connection, style="Surface.TFrame")
+        self.connection_details_host.grid(row=1, column=0, sticky="ew")
+        self.connection_details_host.pack_propagate(False)
+        self.connection_details = ttk.Frame(
+            self.connection_details_host,
+            padding=(0, 10, 0, 0),
+            style="Surface.TFrame",
+        )
+        self.connection_details.pack(fill="x")
         self.connection_details.columnconfigure(3, weight=1)
         self.connection_details.columnconfigure(5, weight=1)
         ttk.Label(self.connection_details, text="模式").grid(row=0, column=0, sticky="w")
@@ -554,6 +630,8 @@ class SafeControlApp:
             text="一键准备并武装",
             command=self._prepare_and_arm,
             style="Primary.TButton",
+            image=self.ui_assets.icon("stand"),
+            compound="left",
         )
         self.prepare_button.pack(side="left")
         posture_actions = ttk.LabelFrame(
@@ -578,6 +656,10 @@ class SafeControlApp:
                 text=label,
                 command=lambda selected=action: self._run_sport_action(selected),
                 style="Secondary.TButton",
+                image=self.ui_assets.icon(
+                    "lie_down" if action in {"stand_down", "sit"} else "stand"
+                ),
+                compound="left",
             )
             button.grid(row=index // 3, column=index % 3, sticky="ew", padx=3, pady=3)
             self._sport_action_buttons[action] = button
@@ -603,6 +685,42 @@ class SafeControlApp:
             button.grid(row=0, column=column, sticky="ew", padx=3, pady=3)
             interaction_actions.columnconfigure(column, weight=1)
             self._sport_action_buttons[action] = button
+        audio_actions = ttk.LabelFrame(
+            safety, text="机器狗声音", padding=8, style="Panel.TLabelframe"
+        )
+        audio_actions.pack(fill="x", pady=(8, 0))
+        self.audio_choose_button = ttk.Button(
+            audio_actions, text="导入 MP3 / WAV", command=self._choose_audio,
+            style="Secondary.TButton",
+        )
+        self.audio_choose_button.grid(row=0, column=0, sticky="ew", padx=3, pady=3)
+        self.audio_play_button = ttk.Button(
+            audio_actions, text="播放声音", command=self._play_audio,
+            style="Secondary.TButton",
+        )
+        self.audio_play_button.grid(row=0, column=1, sticky="ew", padx=3, pady=3)
+        self.audio_stop_button = ttk.Button(
+            audio_actions, text="停止声音", command=self._stop_audio,
+            style="Secondary.TButton",
+        )
+        self.audio_stop_button.grid(row=0, column=2, sticky="ew", padx=3, pady=3)
+        self.audio_sync_button = ttk.Button(
+            audio_actions, text="同步声音库", command=self._sync_sound_library,
+            style="Secondary.TButton",
+        )
+        self.audio_sync_button.grid(row=0, column=3, sticky="ew", padx=3, pady=3)
+        for column in range(4):
+            audio_actions.columnconfigure(column, weight=1)
+        ttk.Label(
+            audio_actions, textvariable=self.audio_var,
+            style="Muted.TLabel", wraplength=600,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=3)
+        self.audio_choice_box = ttk.Combobox(
+            audio_actions, textvariable=self.audio_choice_var,
+            values=(), state="readonly",
+        )
+        self.audio_choice_box.grid(row=2, column=0, columnspan=4, sticky="ew", padx=3, pady=(4, 0))
+        self.audio_choice_box.bind("<<ComboboxSelected>>", self._audio_choice_changed)
         safety_status = ttk.Frame(safety, style="Raised.TFrame")
         safety_status.pack(fill="x", pady=(10, 0))
         ttk.Label(
@@ -635,17 +753,11 @@ class SafeControlApp:
         self._motion_button(pad, "S\n后退", "s", 1, 1)
         self._motion_button(pad, "D\n右移", "d", 1, 2)
 
-        self.stop_motion_button = tk.Button(
+        self.stop_motion_button = ttk.Button(
             controls,
             text="停止移动（保持武装）",
             command=self._stop_motion,
-            background=UI_WARNING,
-            foreground="black",
-            activebackground="#FFB52E",
-            activeforeground="black",
-            font=(UI_FONT, 10, "bold"),
-            relief="raised",
-            pady=7,
+            style="Warning.TButton",
         )
         self.stop_motion_button.pack(fill="x", padx=80, pady=(4, 10))
 
@@ -690,23 +802,17 @@ class SafeControlApp:
             style="Telemetry.TLabel",
         ).pack(pady=(8, 0))
 
-        ttk.Label(
-            camera,
-            text="开启后显示 Go2 前置摄像头；不录像、不保存。",
-            wraplength=480,
-            style="Muted.TLabel",
-        ).pack(anchor="w")
-        camera_preview = ttk.Frame(camera, height=CAMERA_PREVIEW_MAX_HEIGHT)
-        camera_preview.pack(fill="x", pady=12)
+        camera_preview = ttk.Frame(camera, height=CAMERA_PREVIEW_MAX_HEIGHT + 36)
+        camera_preview.pack(fill="both", expand=True, pady=(0, 12))
         camera_preview.pack_propagate(False)
         self.camera_label = ttk.Label(
             camera_preview,
             text="等待开启摄像头",
             anchor="center",
             style="Camera.TLabel",
-            width=60,
         )
         self.camera_label.pack(fill="both", expand=True, ipadx=4)
+
         camera_actions = ttk.Frame(camera)
         camera_actions.pack(fill="x")
         self.camera_button = ttk.Button(
@@ -714,6 +820,8 @@ class SafeControlApp:
             text="开启摄像头",
             command=self._toggle_camera,
             style="Primary.TButton",
+            image=self.ui_assets.icon("camera"),
+            compound="left",
         )
         self.camera_button.pack(side="left")
         self.camera_stop_button = ttk.Button(
@@ -721,15 +829,46 @@ class SafeControlApp:
             text="关闭摄像头",
             command=self._stop_camera,
             style="Secondary.TButton",
+            image=self.ui_assets.icon("camera"),
+            compound="left",
         )
         self.camera_stop_button.pack(side="left", padx=8)
+
+        self.record_start_button = ttk.Button(
+            camera_actions,
+            text=f"开始录制（{RECORD_SHORTCUT_LABEL}）",
+            command=self._start_recording,
+            style="Primary.TButton",
+            image=self.ui_assets.icon("record_start"),
+            compound="left",
+        )
+        self.record_start_button.pack(side="left", padx=(8, 0))
+        self.record_stop_button = ttk.Button(
+            camera_actions,
+            text="停止并保存",
+            command=self._stop_recording,
+            style="Secondary.TButton",
+            image=self.ui_assets.icon("record_stop"),
+            compound="left",
+        )
+        self.record_stop_button.pack(side="left", padx=8)
+
+        ttk.Label(
+            camera,
+            textvariable=self.recording_var,
+            wraplength=900,
+            style="Status.TLabel",
+        ).pack(anchor="w", pady=(8, 0))
+
         recognition_actions = ttk.Frame(camera)
-        recognition_actions.pack(fill="x", pady=(8, 0))
+        recognition_actions.pack(fill="x", pady=(10, 0))
         self.person_start_button = ttk.Button(
             recognition_actions,
             text="开启人员识别",
             command=self._start_person_detection,
             style="Secondary.TButton",
+            image=self.ui_assets.icon("person"),
+            compound="left",
         )
         self.person_start_button.pack(side="left", padx=(0, 8))
         self.person_stop_button = ttk.Button(
@@ -737,6 +876,8 @@ class SafeControlApp:
             text="关闭人员识别",
             command=self._stop_person_detection,
             style="Secondary.TButton",
+            image=self.ui_assets.icon("person"),
+            compound="left",
         )
         self.person_stop_button.pack(side="left", padx=(0, 8))
         self.person_refresh_button = ttk.Button(
@@ -744,33 +885,14 @@ class SafeControlApp:
             text="刷新识别（F5）",
             command=self._refresh_person_detection,
             style="Secondary.TButton",
+            image=self.ui_assets.icon("refresh"),
+            compound="left",
         )
-        self.person_refresh_button.pack(side="left", padx=(0, 12))
-        ttk.Label(recognition_actions, text="刷新快捷键").pack(side="left", padx=(0, 6))
-        self.person_refresh_shortcut_box = ttk.Combobox(
-            recognition_actions,
-            textvariable=self.person_refresh_shortcut_var,
-            values=PERSON_REFRESH_SHORTCUTS,
-            state="readonly",
-            width=5,
-        )
-        self.person_refresh_shortcut_box.pack(side="left")
-        self.person_refresh_shortcut_box.bind(
-            "<<ComboboxSelected>>",
-            self._on_refresh_shortcut_changed,
-        )
-        ttk.Label(
-            camera,
-            textvariable=self.camera_var,
-            wraplength=480,
-            style="Status.TLabel",
-        ).pack(
-            anchor="w", pady=(10, 0)
-        )
+        self.person_refresh_button.pack(side="left")
 
         ttk.Label(
             workflow,
-            text="按顺序执行；移动按时间控制，不代表精确里程。空格或红色急停随时中止。",
+            text="按顺序执行；灯光确认后进入下一步，灯色按设定秒数保持。移动按时间控制；空格可急停。",
             wraplength=480,
             style="Muted.TLabel",
         ).pack(anchor="w")
@@ -843,8 +965,19 @@ class SafeControlApp:
         self.workflow_duration_entry.grid(
             row=1, column=3, padx=(8, 0), sticky="ew"
         )
+        self.workflow_sound_label = ttk.Label(editor, text="声音库")
+        self.workflow_sound_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.workflow_sound_box = ttk.Combobox(
+            editor, textvariable=self.workflow_sound_var,
+            values=(), state="readonly",
+        )
+        self.workflow_sound_box.grid(
+            row=2, column=1, columnspan=3, padx=(8, 0), pady=(8, 0), sticky="ew"
+        )
+        self.workflow_sound_box.bind("<<ComboboxSelected>>", self._workflow_sound_changed)
+        self._refresh_sound_choices()
         editor_actions = ttk.Frame(editor)
-        editor_actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        editor_actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         editor_buttons = (
             ("添加", self._add_workflow_step, "Primary.TButton"),
             ("更新", self._update_workflow_step, "Secondary.TButton"),
@@ -862,6 +995,7 @@ class SafeControlApp:
             )
             button.grid(row=0, column=column, padx=2, sticky="ew")
             self._workflow_edit_buttons.append(button)
+        self._update_workflow_sound_visibility()
 
         file_actions = ttk.Frame(workflow)
         file_actions.pack(fill="x", pady=(8, 0))
@@ -877,38 +1011,32 @@ class SafeControlApp:
                 text=text,
                 command=command,
                 style="Secondary.TButton",
+                image=self.ui_assets.icon("save"),
+                compound="left",
             )
             button.grid(row=0, column=column, padx=2, sticky="ew")
             self._workflow_file_buttons.append(button)
 
         run_actions = ttk.Frame(workflow)
         run_actions.pack(fill="x", pady=(10, 0))
-        self.workflow_start_button = tk.Button(
+        self.workflow_start_button = ttk.Button(
             run_actions,
             text="一键启动流程",
             command=self._start_workflow,
-            background="#1F6FB2",
-            foreground="white",
-            activebackground="#2F80C5",
-            activeforeground="white",
-            font=(UI_FONT, 10, "bold"),
-            relief="raised",
-            pady=8,
+            style="Primary.TButton",
+            image=self.ui_assets.icon("workflow"),
+            compound="left",
         )
         run_actions.columnconfigure(0, weight=1)
         run_actions.columnconfigure(1, weight=1)
         self.workflow_start_button.grid(row=0, column=0, padx=(0, 4), sticky="ew")
-        self.workflow_stop_button = tk.Button(
+        self.workflow_stop_button = ttk.Button(
             run_actions,
             text="立即停止流程",
             command=self._stop_workflow,
-            background=UI_DANGER,
-            foreground="white",
-            activebackground="#D82727",
-            activeforeground="white",
-            font=(UI_FONT, 10, "bold"),
-            relief="raised",
-            pady=8,
+            style="Danger.TButton",
+            image=self.ui_assets.icon("emergency"),
+            compound="left",
         )
         self.workflow_stop_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
         ttk.Label(
@@ -933,10 +1061,12 @@ class SafeControlApp:
             wrap="word",
             state="disabled",
             font=(UI_MONO_FONT, 9),
-            background="SystemWindow",
-            foreground="SystemWindowText",
-            insertbackground="SystemWindowText",
-            relief="sunken",
+            background=COLORS.surface_subtle,
+            foreground=COLORS.text,
+            insertbackground=COLORS.text,
+            selectbackground=COLORS.primary_soft,
+            selectforeground=COLORS.primary_hover,
+            relief="flat",
             borderwidth=1,
             highlightthickness=0,
         )
@@ -965,50 +1095,80 @@ class SafeControlApp:
             style="Path.TLabel",
         ).pack(anchor="w", pady=(6, 0))
         self._sync_control_states()
+        self._set_connection_details_visible(True)
 
     # ==================== 页面滚动与尺寸适配 ====================
 
+    def _resize_page_background(self, event: tk.Event[tk.Misc]) -> None:
+        """让主背景跟随整个内容区域，并始终位于所有功能控件下方。"""
+
+        self._page_background_photo = self.ui_assets.main_background(
+            event.width,
+            event.height,
+        )
+        self.page_background_label.configure(image=self._page_background_photo)
+        self.page_background_label.lower()
+
+    def _resize_tab_background(
+        self,
+        event: tk.Event[tk.Misc],
+        label: tk.Label,
+    ) -> None:
+        """让每个功能页共享同一背景，文字、图标和按钮保持在图片上方。"""
+
+        photo = self.ui_assets.main_background(event.width, event.height)
+        self._tab_background_photos[str(label)] = photo
+        label.configure(image=photo)
+        label.lower()
+
+    def _resize_header_art(self, event: tk.Event[tk.Canvas]) -> None:
+        """随窗口宽度重绘品牌背景，并保持急停与进度状态在右侧对齐。"""
+
+        width = max(1, event.width)
+        self._header_background_photo = self.ui_assets.header_background(
+            width,
+            HEADER_HEIGHT,
+        )
+        self.header_canvas.itemconfigure(
+            self._header_background_item,
+            image=self._header_background_photo,
+        )
+        self.header_canvas.coords(
+            self._emergency_window,
+            width - 12,
+            HEADER_HEIGHT // 2,
+        )
+        progress_x = width - self.emergency_button.winfo_reqwidth() - 28
+        self.header_canvas.coords(
+            self._activity_progress_window,
+            progress_x,
+            HEADER_HEIGHT // 2,
+        )
+
     def _update_header_activity(self, now: float) -> None:
-        """显示稳定的全局状态；耗时操作只使用系统进度条反馈。"""
+        """只在后台操作期间显示系统进度条，不额外堆叠状态文字。"""
 
-        if now - self._last_animation_at < 0.25:
-            return
-        self._last_animation_at = now
-        self._animation_frame = (self._animation_frame + 1) % 4
-
-        busy = False
-        if self.workflow_runner.running or self._workflow_preparing:
-            workflow_text = "自动流程运行中"
-            busy = True
-        else:
-            workflow_text = "流程空闲"
-        if "正在" in self.connection_var.get():
-            connection_text = "连接处理中"
-            busy = True
-        elif self.session.connected:
-            connection_text = "已连接"
-        else:
-            connection_text = "未连接"
-        if "正在" in self.camera_var.get():
-            camera_text = "摄像头处理中"
-            busy = True
-        elif self._person_detection_enabled:
-            camera_text = "摄像头已开 · 人员识别已开"
-        elif self._camera_requested:
-            camera_text = "摄像头已开"
-        else:
-            camera_text = "摄像头关闭"
-        arm_text = "已武装" if self.policy.armed else "未武装"
-        self.header_activity_var.set(
-            f"连接：{connection_text}  ·  控制：{arm_text}  ·  "
-            f"{camera_text}  ·  {workflow_text}"
+        del now  # 心跳接口保留时间参数，当前判断不需要使用它。
+        busy = (
+            self.workflow_runner.running
+            or self._workflow_preparing
+            or "正在" in self.connection_var.get()
+            or "正在" in self.camera_var.get()
         )
 
         if busy and not self._activity_busy:
+            self.header_canvas.itemconfigure(
+                self._activity_progress_window,
+                state="normal",
+            )
             self.activity_progress.start(12)
         elif not busy and self._activity_busy:
             self.activity_progress.stop()
             self.activity_progress.configure(value=0)
+            self.header_canvas.itemconfigure(
+                self._activity_progress_window,
+                state="hidden",
+            )
         self._activity_busy = busy
 
     def _sync_motion_button_feedback(self) -> None:
@@ -1088,17 +1248,67 @@ class SafeControlApp:
     def _set_connection_details_visible(self, visible: bool) -> None:
         """展开或折叠低频连接参数，连接状态和操作按钮始终可见。"""
 
+        if self._connection_animation_id is not None:
+            self.root.after_cancel(self._connection_animation_id)
+            self._connection_animation_id = None
         self._connection_details_visible = visible
         if visible:
-            self.connection_details.grid()
+            self.connection_details_host.grid()
+            self.root.update_idletasks()
+            self.connection_details_host.configure(
+                height=max(1, self.connection_details.winfo_reqheight())
+            )
             self.connection_toggle_button.configure(text="收起连接设置")
         else:
-            self.connection_details.grid_remove()
+            self.connection_details_host.grid_remove()
             self.connection_toggle_button.configure(text="展开连接设置")
-        self.root.after_idle(self._resize_active_tab)
+        self._schedule_ui_idle(self._resize_active_tab)
 
     def _toggle_connection_details(self) -> None:
-        self._set_connection_details_visible(not self._connection_details_visible)
+        self._animate_connection_details(not self._connection_details_visible)
+
+    def _animate_connection_details(self, visible: bool) -> None:
+        """平滑展开连接参数；动画只改变界面高度，不接触通信状态。"""
+
+        if self._connection_animation_id is not None:
+            self.root.after_cancel(self._connection_animation_id)
+            self._connection_animation_id = None
+
+        self._connection_details_visible = visible
+        self.connection_toggle_button.configure(
+            text="收起连接设置" if visible else "展开连接设置"
+        )
+        if visible:
+            self.connection_details_host.grid()
+            self.root.update_idletasks()
+            start_height = 0
+            target_height = max(1, self.connection_details.winfo_reqheight())
+            self.connection_details_host.configure(height=start_height)
+        else:
+            start_height = max(1, self.connection_details_host.winfo_height())
+            target_height = 0
+
+        frames = 10
+        frame_delay = max(1, MOTION_DURATION_MS // frames)
+
+        def render(frame: int) -> None:
+            progress = ease_out_cubic(frame / frames)
+            height = round(start_height + (target_height - start_height) * progress)
+            self.connection_details_host.configure(height=max(1, height))
+            self._resize_active_tab()
+            if frame < frames:
+                self._connection_animation_id = self.root.after(
+                    frame_delay,
+                    render,
+                    frame + 1,
+                )
+                return
+            self._connection_animation_id = None
+            if not visible:
+                self.connection_details_host.grid_remove()
+            self._schedule_ui_idle(self._resize_active_tab)
+
+        render(1)
 
     @staticmethod
     def _set_enabled(widget: tk.Misc, enabled: bool) -> None:
@@ -1124,6 +1334,12 @@ class SafeControlApp:
             self.mode_var.get(),
             self._camera_requested,
             self._person_detection_enabled,
+            self._video_recorder.is_recording,
+            self._audio_file,
+            self._selected_audio_id,
+            self._audio_busy,
+            self.session.audio_catalog_ready,
+            self.session.has_synced_audio(self._selected_audio_id) if self._selected_audio_id else False,
         )
         if signature == self._last_control_state_signature:
             return
@@ -1143,6 +1359,21 @@ class SafeControlApp:
         )
         for button in self._sport_action_buttons.values():
             self._set_enabled(button, connected and hardware_confirmed and not workflow_running)
+        self._set_enabled(
+            self.audio_choose_button,
+            not self._audio_busy and not workflow_running and not self.policy.armed,
+        )
+        self._set_enabled(
+            self.audio_play_button,
+            connected and bool(self._selected_audio_id) and
+            self.session.has_synced_audio(self._selected_audio_id) and
+            not self._audio_busy and not workflow_running,
+        )
+        self._set_enabled(self.audio_stop_button, connected and self._audio_busy)
+        self._set_enabled(
+            self.audio_sync_button,
+            connected and not self.policy.armed and not self._audio_busy and not workflow_running,
+        )
         for button in self._motion_buttons.values():
             self._set_enabled(button, motion_ready)
         self._set_enabled(self.stop_motion_button, connected)
@@ -1152,6 +1383,11 @@ class SafeControlApp:
 
         self._set_enabled(self.camera_button, connected and not self._camera_requested)
         self._set_enabled(self.camera_stop_button, connected and self._camera_requested)
+        self._set_enabled(
+            self.record_start_button,
+            connected and self._camera_requested and not self._video_recorder.is_recording,
+        )
+        self._set_enabled(self.record_stop_button, self._video_recorder.is_recording)
         self._set_enabled(
             self.person_start_button,
             connected and self._camera_requested and not self._person_detection_enabled,
@@ -1199,7 +1435,7 @@ class SafeControlApp:
         """窗口变化时同步页面宽度和单一主工作区高度。"""
 
         self.page_canvas.itemconfigure(self._page_window, width=event.width)
-        self.root.after_idle(self._resize_active_tab)
+        self._schedule_ui_idle(self._resize_active_tab)
 
     def _resize_active_tab(self, _event: object = None) -> None:
         """按当前页真实高度调整工作区；超出窗口时交给整页滚动访问。"""
@@ -1209,12 +1445,12 @@ class SafeControlApp:
             return
         active_page = self.main_tabs.nametowidget(selected)
         viewport_height = max(1, self.page_canvas.winfo_height())
-        connection_height = 148 if self._connection_details_visible else 68
+        connection_height = max(68, self.connection_slot.winfo_height())
         available_height = viewport_height - HEADER_HEIGHT - connection_height - 36
         required_height = active_page.winfo_reqheight() + 38
         tab_height = max(430, min(620, max(available_height, required_height)))
         self.main_tabs.configure(height=tab_height)
-        self.root.after_idle(self._update_page_scrollregion)
+        self._schedule_ui_idle(self._update_page_scrollregion)
 
     def _scroll_page(self, event: tk.Event[tk.Misc]) -> None:
         """把鼠标滚轮转换成整页滚动；表格等自带滚动控件除外。"""
@@ -1239,7 +1475,58 @@ class SafeControlApp:
 
         speed = f"{step.speed:.2f}" if step.moving else "—"
         duration = f"{step.duration:.1f}s" if step.duration else "—"
-        return step.label, speed, duration, state
+        label = step.label
+        if step.action == "play_sound":
+            try:
+                label += f" · {self.sound_library.get(step.asset_id).name}"
+            except ValueError:
+                label += " · 素材缺失"
+        return label, speed, duration, state
+
+    def _refresh_sound_choices(self) -> None:
+        self._sound_choices = {
+            f"{sound.name} · {sound.asset_id[:8]}": sound.asset_id
+            for sound in self.sound_library.list_sounds()
+        }
+        if hasattr(self, "workflow_sound_box"):
+            self.workflow_sound_box.configure(values=tuple(self._sound_choices))
+            if self.workflow_sound_var.get() not in self._sound_choices and self._sound_choices:
+                self.workflow_sound_var.set(next(iter(self._sound_choices)))
+        if hasattr(self, "audio_choice_box"):
+            self.audio_choice_box.configure(values=tuple(self._sound_choices))
+            if self.audio_choice_var.get() not in self._sound_choices and self._sound_choices:
+                self.audio_choice_var.set(next(iter(self._sound_choices)))
+                self._audio_choice_changed()
+
+    def _audio_choice_changed(self, _event: object = None) -> None:
+        asset_id = self._sound_choices.get(self.audio_choice_var.get(), "")
+        if asset_id:
+            sound = self.sound_library.get(asset_id)
+            self._selected_audio_id = asset_id
+            self._audio_file = sound.path
+            self.audio_var.set(f"已选择：{sound.name}")
+            if hasattr(self, "workflow_start_button"):
+                self._sync_control_states()
+
+    def _update_workflow_sound_visibility(self) -> None:
+        visible = self.workflow_action_var.get() == ACTION_LABELS["play_sound"]
+        if visible:
+            self.workflow_sound_label.grid()
+            self.workflow_sound_box.grid()
+        else:
+            self.workflow_sound_label.grid_remove()
+            self.workflow_sound_box.grid_remove()
+
+    def _workflow_sound_changed(self, _event: object = None) -> None:
+        asset_id = self._sound_choices.get(self.workflow_sound_var.get(), "")
+        if asset_id:
+            sound = self.sound_library.get(asset_id)
+            self._selected_audio_id = asset_id
+            self._audio_file = sound.path
+            self.audio_choice_var.set(self.workflow_sound_var.get())
+            self.workflow_duration_var.set(f"{min(120.0, sound.duration + 0.3):.2f}")
+            self.audio_var.set(f"已选择：{sound.name}")
+            self._sync_control_states()
 
     def _refresh_workflow_tree(self, *, completed: bool = False) -> None:
         """根据内存中的流程和运行状态，重新绘制右侧步骤表。"""
@@ -1280,6 +1567,11 @@ class SafeControlApp:
         self.workflow_action_var.set(step.label)
         self.workflow_speed_var.set(f"{step.speed:.2f}" if step.moving else "")
         self.workflow_duration_var.set(f"{step.duration:.2f}" if step.duration else "")
+        if step.action == "play_sound":
+            self.workflow_sound_var.set(next(
+                (label for label, asset_id in self._sound_choices.items() if asset_id == step.asset_id), ""
+            ))
+        self._update_workflow_sound_visibility()
 
     def _workflow_action_changed(self, _event: object = None) -> None:
         label = self.workflow_action_var.get()
@@ -1299,9 +1591,16 @@ class SafeControlApp:
         elif action in SPORT_ACTIONS:
             self.workflow_speed_var.set("")
             self.workflow_duration_var.set("3.00")
+        elif action == "play_sound":
+            self.workflow_speed_var.set("")
+            self._workflow_sound_changed()
+        elif action in LIGHT_ACTIONS:
+            self.workflow_speed_var.set("")
+            self.workflow_duration_var.set("8" if action == "light_red_flash" else "5")
         else:
             self.workflow_speed_var.set("")
             self.workflow_duration_var.set("")
+        self._update_workflow_sound_visibility()
 
     def _step_from_editor(self) -> WorkflowStep | None:
         """读取下方三个编辑框，并复用 parse_workflow 完成安全校验。"""
@@ -1313,6 +1612,7 @@ class SafeControlApp:
                         "action": self.workflow_action_var.get(),
                         "speed": self.workflow_speed_var.get(),
                         "duration": self.workflow_duration_var.get(),
+                        "asset_id": self._sound_choices.get(self.workflow_sound_var.get(), ""),
                     }
                 ]
             )[0]
@@ -1418,7 +1718,13 @@ class SafeControlApp:
         if not path:
             return
         try:
-            Path(path).write_text(workflow_to_json(self.workflow_steps), encoding="utf-8")
+            output = Path(path)
+            encoded = workflow_to_json(self.workflow_steps)
+            sound_ids = {step.asset_id for step in self.workflow_steps if step.action == "play_sound"}
+            self.sound_library.export_for_workflow(
+                sound_ids, output.with_name(output.stem + "_声音素材")
+            )
+            output.write_text(encoded, encoding="utf-8")
         except (OSError, ValueError) as exc:
             self._log_issue("保存流程失败", str(exc))
             return
@@ -1436,11 +1742,18 @@ class SafeControlApp:
         if not path:
             return
         try:
-            self.workflow_steps = workflow_from_json(Path(path).read_text(encoding="utf-8"))
+            source = Path(path)
+            steps = workflow_from_json(source.read_text(encoding="utf-8"))
+            self.sound_library.import_workflow_assets(
+                {step.asset_id for step in steps if step.action == "play_sound"},
+                source.with_name(source.stem + "_声音素材"),
+            )
+            self.workflow_steps = steps
         except (OSError, ValueError) as exc:
             self._log_issue("读取流程失败", str(exc))
             return
         self.workflow_status_var.set(f"已读取流程：{Path(path).name}")
+        self._refresh_sound_choices()
         self._refresh_workflow_tree()
 
     def _start_workflow(self) -> None:
@@ -1448,6 +1761,9 @@ class SafeControlApp:
 
         if self.workflow_runner.running:
             self._log_issue("流程正在运行", "当前流程尚未结束。")
+            return
+        if self._audio_busy:
+            self._log_issue("声音操作未结束", "请先停止手动声音或等待声音库同步完成。")
             return
         if not self.session.connected:
             self._log_issue("尚未连接", "请先连接 Go2。")
@@ -1460,19 +1776,42 @@ class SafeControlApp:
         except ValueError as exc:
             self._log_issue("流程错误", str(exc))
             return
-        total = sum(step.duration for step in steps)
+        sound_steps = [step for step in steps if step.action == "play_sound"]
+        if sound_steps:
+            try:
+                for step in sound_steps:
+                    sound = self.sound_library.get(step.asset_id)
+                    if step.duration + 0.05 < sound.duration:
+                        raise ValueError(
+                            f"{sound.name} 长 {sound.duration:.1f} 秒，流程等待只有 {step.duration:.1f} 秒；请延长此步时长。"
+                        )
+            except ValueError as exc:
+                self._log_issue("流程声音素材错误", str(exc))
+                return
+            if not self.session.audio_catalog_ready:
+                self._log_issue("声音库未就绪", "尚未核对机器狗声音库；请稍后重试或检查错误日志。")
+                return
+            missing = [
+                self.sound_library.get(step.asset_id).name for step in sound_steps
+                if not self.session.has_synced_audio(step.asset_id)
+            ]
+            if missing:
+                self._log_issue("流程声音未同步", "请先点击“同步声音库”：" + "、".join(dict.fromkeys(missing)))
+                return
+        total = sum(step.duration for step in steps if step.action not in LIGHT_ACTIONS)
         # 列表推导式为确认框生成“1. 站起、2. 等待……”这样的摘要。
         lines = [
             f"{index}. {step.label}"
             + (f" {step.speed:.2f}，{step.duration:.1f} 秒" if step.moving else "")
-            + (f"，等待 {step.duration:.1f} 秒" if step.duration and not step.moving else "")
+            + (f"，亮灯 {step.duration:.0f} 秒，确认后进入下一步" if step.action in LIGHT_ACTIONS else "")
+            + (f"，等待 {step.duration:.1f} 秒" if step.duration and not step.moving and step.action not in LIGHT_ACTIONS else "")
             for index, step in enumerate(steps, start=1)
         ]
         confirmed = self._ask_confirmation(
             "确认启动自动流程",
             "程序将自动准备行走模式并依次执行以下步骤：\n\n"
             + "\n".join(lines)
-            + f"\n\n预计总时长约 {total:.1f} 秒。"
+            + f"\n\n计时步骤合计约 {total:.1f} 秒；灯光持续期间可执行后续步骤。"
             "\n执行期间必须始终准备实体遥控器急停。确认启动吗？",
         )
         if not confirmed:
@@ -1481,6 +1820,9 @@ class SafeControlApp:
         self._emergency_stop(show_status=False)
         self.workflow_runner.start(steps)
         self._workflow_preparing = False
+        self._workflow_audio_pending = False
+        self._workflow_light_pending_id = None
+        self._workflow_light_deadline = 0.0
         self._workflow_resume_after = 0.0
         self.deadman_keys.clear()
         self.click_motion.stop()
@@ -1492,9 +1834,19 @@ class SafeControlApp:
         """取消流程并清理相关状态；返回取消前是否确实在运行。"""
 
         was_running = self.workflow_runner.running or self._workflow_preparing
+        was_audio = self._workflow_audio_pending or (
+            self.workflow_runner.current_step is not None and
+            self.workflow_runner.current_step.action == "play_sound"
+        )
         self.workflow_runner.cancel()
         self._workflow_preparing = False
+        self._workflow_audio_pending = False
+        self._workflow_light_pending_id = None
+        self._workflow_light_deadline = 0.0
         self._workflow_resume_after = 0.0
+        if was_audio:
+            self.session.stop_audio()
+            self._audio_busy = False
         if hasattr(self, "workflow_start_button"):
             self.workflow_start_button.configure(state="normal")
         if was_running:
@@ -1527,6 +1879,30 @@ class SafeControlApp:
             self.policy.disarm()
             self.input_guard.deactivate()
             self.session.sport_action(step.action)
+        elif step.action == "play_sound":
+            self.policy.disarm()
+            self.input_guard.deactivate()
+            self._workflow_audio_pending = True
+            self._audio_busy = True
+            self.session.play_synced_audio(step.asset_id)
+            self.workflow_status_var.set(
+                f"第 {self.workflow_runner.current_index + 1} 步：正在请求机器狗播放声音……"
+            )
+            self._refresh_workflow_tree()
+            return
+        elif step.action in LIGHT_ACTIONS:
+            self.policy.disarm()
+            self.input_guard.deactivate()
+            self._workflow_light_serial += 1
+            request_id = str(self._workflow_light_serial)
+            self._workflow_light_pending_id = request_id
+            self._workflow_light_deadline = now + 5.0
+            self.session.set_light(step.action, int(step.duration), request_id)
+            self.workflow_status_var.set(
+                f"第 {self.workflow_runner.current_index + 1} 步：正在等待头部灯光确认……"
+            )
+            self._refresh_workflow_tree()
+            return
         self.workflow_runner.begin_current(now=now)
         self.workflow_status_var.set(
             f"正在执行第 {self.workflow_runner.current_index + 1}/{self.workflow_runner.step_count} 步："
@@ -1560,6 +1936,22 @@ class SafeControlApp:
         if step is None:
             return Velocity.zero()
 
+        if self._workflow_light_pending_id is not None:
+            if not focused or not self.session.connected or not self.hardware_ok_var.get():
+                self._emergency_stop(show_status=False)
+                self.workflow_status_var.set("自动流程因窗口失焦、断线或安全确认变化而中止")
+            elif now >= self._workflow_light_deadline:
+                self._emergency_stop(show_status=False)
+                self.workflow_status_var.set("自动流程因灯光确认超时而中止")
+                self._log_issue("灯光确认超时", "机器人未及时确认灯光步骤；请检查连接和头灯状态。")
+            return Velocity.zero()
+
+        if self._workflow_audio_pending:
+            if not focused or not self.session.connected or not self.hardware_ok_var.get():
+                self._emergency_stop(show_status=False)
+                self.workflow_status_var.set("自动流程因窗口失焦、断线或安全确认变化而中止")
+            return Velocity.zero()
+
         if self.workflow_runner.awaiting_begin and now < self._workflow_resume_after:
             self.workflow_status_var.set("步骤切换中：保持停止 0.2 秒……")
             return Velocity.zero()
@@ -1584,6 +1976,8 @@ class SafeControlApp:
 
         if self.workflow_runner.awaiting_begin:
             self._begin_workflow_step(step, now=now)
+            if self._workflow_light_pending_id is not None:
+                return Velocity.zero()
 
         if step.moving and (not self.session.walk_ready or not self.policy.armed):
             self._emergency_stop(show_status=False)
@@ -1598,6 +1992,9 @@ class SafeControlApp:
         velocity = velocity_for_step(step)
         advanced = self.workflow_runner.tick(now=now)
         if advanced:
+            if step.action == "play_sound":
+                self.session.stop_audio()
+                self._audio_busy = False
             self.session.update_velocity(Velocity.zero())
             if not self.workflow_runner.running:
                 self._finish_workflow()
@@ -1643,23 +2040,34 @@ class SafeControlApp:
         self.root.bind("<KeyPress>", self._on_key_press)
         self.root.bind("<KeyRelease>", self._on_key_release)
         self.root.bind("<FocusOut>", self._on_focus_out)
+        self.root.bind("<Destroy>", self._cancel_ui_after_callbacks, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _schedule_ui_idle(self, callback: Callable[[], None]) -> None:
+        """安排一次空闲更新，并在窗口销毁前可靠取消。"""
+
+        after_id = ""
+
+        def run() -> None:
+            self._ui_after_ids.discard(after_id)
+            callback()
+
+        after_id = self.root.after_idle(run)
+        self._ui_after_ids.add(after_id)
+
+    def _cancel_ui_after_callbacks(self, event: tk.Event[tk.Misc]) -> None:
+        if event.widget is not self.root:
+            return
+        for after_id in tuple(self._ui_after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._ui_after_ids.clear()
 
     def _on_mode_changed(self, _event: object = None) -> None:
         self._last_control_state_signature = None
         self._sync_control_states()
-
-    def _on_refresh_shortcut_changed(self, _event: object = None) -> None:
-        """更新刷新按钮提示；快捷键只在本次程序运行期间有效。"""
-
-        shortcut = self.person_refresh_shortcut_var.get().upper()
-        if shortcut not in PERSON_REFRESH_SHORTCUTS:
-            shortcut = "F5"
-            self.person_refresh_shortcut_var.set(shortcut)
-        self._refresh_shortcuts_down.clear()
-        self.person_refresh_button.configure(text=f"刷新识别（{shortcut}）")
-        box_label = self._person_box_color_label()
-        self.camera_var.set(f"刷新快捷键已设为 {shortcut}；当前使用{box_label}")
 
     def _connect(self) -> None:
         """校验界面输入，清除旧运动状态，再请求通信层连接。"""
@@ -1807,6 +2215,58 @@ class SafeControlApp:
         self.walk_mode_var.set(f"正在停止并执行{label}……")
         self.session.sport_action(action)
 
+    def _choose_audio(self) -> None:
+        if self.workflow_runner.running or self.policy.armed:
+            self._log_issue("无法导入声音", "请先停止流程并解除运动武装。")
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择机器狗要播放的声音",
+            filetypes=[("音频文件", "*.mp3 *.wav"), ("MP3", "*.mp3"), ("WAV", "*.wav")],
+        )
+        if selected:
+            try:
+                sound = self.sound_library.import_file(Path(selected))
+            except (OSError, ValueError, RuntimeError) as exc:
+                self._log_issue("导入声音失败", str(exc))
+                return
+            self._audio_file = sound.path
+            self._selected_audio_id = sound.asset_id
+            self._refresh_sound_choices()
+            self.workflow_sound_var.set(next(
+                label for label, asset_id in self._sound_choices.items()
+                if asset_id == sound.asset_id
+            ))
+            self.audio_choice_var.set(self.workflow_sound_var.get())
+            self.audio_var.set(f"已导入：{sound.name}；同步声音库后即可播放")
+            self._sync_control_states()
+
+    def _sync_sound_library(self) -> None:
+        if not self.session.connected or self.workflow_runner.running or self.policy.armed or self._audio_busy:
+            self._log_issue("无法同步声音", "请先连接机器狗，停止流程并解除运动武装。")
+            return
+        self._audio_busy = True
+        self.audio_var.set("正在核对并同步机器狗声音库……")
+        self.session.sync_sounds(self.sound_library.list_sounds())
+        self._sync_control_states()
+
+    def _play_audio(self) -> None:
+        if not self.session.connected or not self._selected_audio_id:
+            self._log_issue("声音播放", "请先连接机器狗并从声音库选择音频")
+            return
+        if not self.session.has_synced_audio(self._selected_audio_id):
+            self._log_issue("声音未同步", "请先点击“同步声音库”，再播放。")
+            return
+        self._audio_busy = True
+        self.audio_var.set("正在请求机器狗播放声音……")
+        self._sync_control_states()
+        self.session.play_synced_audio(self._selected_audio_id)
+
+    def _stop_audio(self) -> None:
+        if self.session.connected:
+            self.session.stop_audio()
+            self.audio_var.set("正在停止声音……")
+
     def _toggle_camera(self) -> None:
         """连接存在时请求通信层打开摄像头。"""
 
@@ -1820,6 +2280,8 @@ class SafeControlApp:
         self._sync_control_states()
 
     def _stop_camera(self) -> None:
+        if self._video_recorder.is_recording:
+            self._stop_recording()
         self._camera_requested = False
         self.session.stop_video()
         with self._video_lock:
@@ -1829,6 +2291,62 @@ class SafeControlApp:
         self._camera_photo = None
         self.camera_label.configure(image="", text="摄像头已关闭")
         self.camera_var.set("摄像头未开启")
+        self._last_control_state_signature = None
+        self._sync_control_states()
+
+    def _start_recording(self) -> None:
+        """选择保存位置并开始录制当前预览画面。"""
+
+        if not self.session.connected or not self._camera_requested:
+            self.recording_var.set("无法录制：请先连接并开启摄像头")
+            return
+        if self._video_recorder.is_recording:
+            return
+
+        default_name = time.strftime("Go2_%Y%m%d_%H%M%S.mp4")
+        self._modal_open = True
+        try:
+            selected = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="选择视频保存位置",
+                initialdir=str(self._last_recording_directory),
+                initialfile=default_name,
+                defaultextension=".mp4",
+                filetypes=(
+                    ("MP4 视频", "*.mp4"),
+                    ("AVI 视频", "*.avi"),
+                    ("MKV 视频", "*.mkv"),
+                ),
+            )
+        finally:
+            self._modal_open = False
+            # 文件对话框会接管焦点，原始 R 键的 KeyRelease 可能不会回到根窗口。
+            self._record_shortcut_down = False
+        if not selected:
+            self.recording_var.set(f"已取消录制 · 快捷键 {RECORD_SHORTCUT_LABEL}")
+            return
+
+        output_path = Path(selected)
+        self._last_recording_directory = output_path.parent
+        try:
+            self._video_recorder.start(output_path, fps=20)
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}"
+            self.recording_var.set("录制启动失败，详情见错误日志")
+            self._log_issue("视频录制启动失败", message)
+        self._last_control_state_signature = None
+        self._sync_control_states()
+
+    def _stop_recording(self) -> None:
+        """停止录制并在原路径完成视频文件封装。"""
+
+        if not self._video_recorder.is_recording:
+            return
+        self.recording_var.set("正在停止并保存视频……")
+        if not self._video_recorder.stop(timeout=5.0):
+            message = "录制线程未能在 5 秒内结束；文件可能仍在后台封装。"
+            self.recording_var.set(message)
+            self._log_issue("视频录制停止超时", message)
         self._last_control_state_signature = None
         self._sync_control_states()
 
@@ -1858,20 +2376,25 @@ class SafeControlApp:
         self._sync_control_states()
 
     def _refresh_person_detection(self) -> None:
-        """重新加载模型、清空旧框，并在红色和绿色人员框之间切换。"""
+        """清空旧框，并在“绿色全部”和“红色最高置信度”之间切换。"""
 
         if not self.session.connected or not self._camera_requested:
-            shortcut = self.person_refresh_shortcut_var.get()
-            self.camera_var.set(f"{shortcut} 刷新不可用：请先连接并开启摄像头")
+            self.camera_var.set("F5 刷新不可用：请先连接并开启摄像头")
             return
         self._person_box_color = (
             PERSON_BOX_GREEN
             if self._person_box_color == PERSON_BOX_RED
             else PERSON_BOX_RED
         )
-        self._person_detection.refresh()
+        # 颜色模式不改变 YOLOX 模型，无需重载；清掉旧结果后让下一帧立即按新模式显示。
+        self._person_detection.clear()
         box_label = self._person_box_color_label()
-        self.camera_var.set(f"正在刷新人员识别模型；刷新后使用{box_label}")
+        mode_label = (
+            "最高置信度站立人员标红，其余为绿色"
+            if self._person_box_color == PERSON_BOX_RED
+            else "全部站立人员显示绿色"
+        )
+        self.camera_var.set(f"人员识别已切换为{box_label}：{mode_label}")
 
     def _person_box_color_label(self) -> str:
         """返回供界面显示的人员框颜色名称，避免只依赖颜色表达状态。"""
@@ -1898,7 +2421,17 @@ class SafeControlApp:
         """处理物理按键；返回 'break' 会阻止事件继续进入中文输入法。"""
 
         keysym = str(event.keysym).upper()
-        if keysym == self.person_refresh_shortcut_var.get().upper():
+        if keysym == "R" and int(getattr(event, "state", 0)) & 0x0004:
+            if not self._record_shortcut_down:
+                self._record_shortcut_down = True
+                if not self.session.connected or not self._camera_requested:
+                    self.recording_var.set("无法录制：请先连接并开启摄像头")
+                elif self._video_recorder.is_recording:
+                    self._stop_recording()
+                else:
+                    self._start_recording()
+            return "break"
+        if keysym == "F5":
             if keysym not in self._refresh_shortcuts_down:
                 self._refresh_shortcuts_down.add(keysym)
                 self._refresh_person_detection()
@@ -1917,8 +2450,13 @@ class SafeControlApp:
 
     def _on_key_release(self, event: tk.Event[tk.Misc]) -> str | None:
         keysym = str(event.keysym).upper()
+        if keysym == "R" and (
+            self._record_shortcut_down or int(getattr(event, "state", 0)) & 0x0004
+        ):
+            self._record_shortcut_down = False
+            return "break"
         self._refresh_shortcuts_down.discard(keysym)
-        if keysym == self.person_refresh_shortcut_var.get().upper():
+        if keysym == "F5":
             return "break"
         if self._typing_in_field():
             return None
@@ -1933,7 +2471,7 @@ class SafeControlApp:
 
         if self._modal_open:
             return
-        self.root.after_idle(self._stop_if_app_unfocused)
+        self._schedule_ui_idle(self._stop_if_app_unfocused)
 
     def _stop_if_app_unfocused(self) -> None:
         if self._modal_open:
@@ -2084,7 +2622,12 @@ class SafeControlApp:
             pass
         except Exception as exc:
             # 流程/输入计算若发生未知异常，按安全原则停止，而不是停在“准备中”。
-            self._log_issue("界面心跳错误", f"{type(exc).__name__}: {exc}")
+            step = self.workflow_runner.current_step
+            position = (
+                f"第 {self.workflow_runner.current_index + 1} 步 {step.label}"
+                if step is not None else "未运行流程"
+            )
+            self._log_issue("界面心跳错误", f"{position}；{traceback.format_exc()}")
             self.policy.disarm()
             self.deadman_keys.clear()
             self.click_motion.stop()
@@ -2123,11 +2666,32 @@ class SafeControlApp:
             else None
         )
         if snapshot is not None:
-            frame = draw_person_boxes(frame, snapshot.boxes, self._person_box_color)
-        photo = tk.PhotoImage(data=frame.ppm_bytes(), format="PPM")
-        factor = camera_subsample_factor(frame.width, frame.height)
-        if factor > 1:
-            photo = photo.subsample(factor, factor)
+            green_boxes, red_boxes = split_person_boxes_by_color(
+                snapshot.boxes,
+                self._person_box_color,
+            )
+            frame = draw_person_boxes(frame, green_boxes, PERSON_BOX_GREEN)
+            # 红框最后绘制，重叠时最高置信度目标仍清晰可见。
+            frame = draw_person_boxes(frame, red_boxes, PERSON_BOX_RED)
+        # 录制的是用户在预览中看到的最终画面，因此人员识别框也会保留在视频里。
+        if self._video_recorder.is_recording:
+            self._video_recorder.submit(frame)
+
+        # Pillow 按可用空间等比缩放；识别线程先使用较清晰的原比例画面。
+        from PIL import Image, ImageTk
+
+        area_width = max(CAMERA_PREVIEW_MAX_WIDTH, self.camera_label.winfo_width() - 8)
+        area_height = max(CAMERA_PREVIEW_MAX_HEIGHT, self.camera_label.winfo_height() - 8)
+        target_width, target_height = fit_camera_preview_size(
+            frame.width,
+            frame.height,
+            area_width,
+            area_height,
+        )
+        image = Image.frombytes("RGB", (frame.width, frame.height), frame.rgb)
+        if (target_width, target_height) != (frame.width, frame.height):
+            image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
         # 必须把 PhotoImage 保存在实例字段中，否则会被垃圾回收后画面消失。
         self._camera_photo = photo
         self.camera_label.configure(image=self._camera_photo, text="")
@@ -2136,7 +2700,26 @@ class SafeControlApp:
                 f"摄像头画面接收正常 · 人员识别已开启（{self._person_box_color_label()}）"
             )
         else:
-            self.camera_var.set("摄像头画面接收正常（不保存）")
+            self.camera_var.set("摄像头画面接收正常")
+
+    def _queue_recording_event(self, kind: str, message: str) -> None:
+        """把录制线程状态安全地送回 Tkinter 主线程。"""
+
+        try:
+            self.root.after(0, self._handle_recording_event, kind, message)
+        except tk.TclError:
+            pass
+
+    def _handle_recording_event(self, kind: str, message: str) -> None:
+        """显示录制进度；错误写入日志，不弹出额外窗口。"""
+
+        if kind == "error":
+            self.recording_var.set("录制失败，详情见错误日志")
+            self._log_issue("视频录制错误", message)
+        else:
+            self.recording_var.set(message)
+        self._last_control_state_signature = None
+        self._sync_control_states()
 
     def _queue_person_detection_event(self, kind: str, message: str) -> None:
         """把识别线程状态送回 Tkinter 主线程。"""
@@ -2166,6 +2749,8 @@ class SafeControlApp:
         elif kind == "error":
             self.camera_var.set("摄像头继续预览 · 人员识别加载失败，详情见错误日志")
             self._log_issue("人员识别错误", message)
+        elif kind == "diagnostic":
+            self._append_log("人员识别诊断", message, update_error_summary=False)
 
     def _queue_session_event(self, kind: EventKind, message: str) -> None:
         """把后台通信事件排入 Tkinter 主线程，避免跨线程直接改控件。"""
@@ -2200,7 +2785,7 @@ class SafeControlApp:
                         # 手动准备完成后直接展示运动区，减少一次额外查找和点击。
                         self.main_tabs.select(1)
                     self.root.focus_set()
-                    self.root.after_idle(self._activate_control_input)
+                    self._schedule_ui_idle(self._activate_control_input)
                 else:
                     self.arm_var.set("自动武装已取消：连接或安全确认状态已变化")
         elif kind == "walk_not_ready":
@@ -2214,6 +2799,58 @@ class SafeControlApp:
                 self.arm_var.set("未武装：不会发送移动命令")
         elif kind == "camera":
             self.camera_var.set(message)
+        elif kind == "audio":
+            self.audio_var.set(message)
+            if message in {"声音已停止", "音频上传或播放已取消", "声音库同步已取消", "声音播放已取消"}:
+                self._audio_busy = False
+        elif kind == "audio_catalog":
+            self.audio_var.set(message)
+        elif kind == "audio_sync_done":
+            self.audio_var.set(message)
+            self._audio_busy = False
+        elif kind == "audio_started":
+            try:
+                sound_name = self.sound_library.get(message).name
+            except ValueError:
+                sound_name = "声音"
+            self.audio_var.set(f"机器狗正在播放：{sound_name}")
+            step = self.workflow_runner.current_step
+            if self._workflow_audio_pending and step is not None and step.asset_id == message:
+                self._workflow_audio_pending = False
+                self.workflow_runner.begin_current(now=time.monotonic())
+                self.workflow_status_var.set(f"第 {self.workflow_runner.current_index + 1} 步：{sound_name} 已开始，按设定时长等待")
+                self._refresh_workflow_tree()
+        elif kind == "audio_error":
+            self.audio_var.set("声音操作失败；请查看错误日志")
+            self._audio_busy = False
+            if self._workflow_audio_pending:
+                self._emergency_stop(show_status=False)
+                self.workflow_status_var.set("自动流程因声音未能播放而中止")
+            self._log_issue("机器狗声音", message)
+        elif kind == "light_started":
+            if message == self._workflow_light_pending_id and self.workflow_runner.running:
+                step = self.workflow_runner.current_step
+                if step is not None and step.action in LIGHT_ACTIONS:
+                    self._workflow_light_pending_id = None
+                    self._workflow_light_deadline = 0.0
+                    now = time.monotonic()
+                    self.workflow_runner.begin_current(now=now)
+                    self.workflow_runner.complete_current()
+                    self.session.update_velocity(Velocity.zero())
+                    if self.workflow_runner.running:
+                        self._workflow_resume_after = now + 0.20
+                        self.workflow_status_var.set(
+                            f"{step.label} 已确认；灯光按设定时长保持，随后步骤可继续执行"
+                        )
+                        self._refresh_workflow_tree()
+                    else:
+                        self._finish_workflow()
+        elif kind == "light_error":
+            request_id, _, detail = message.partition("|")
+            if request_id == self._workflow_light_pending_id:
+                self._emergency_stop(show_status=False)
+                self.workflow_status_var.set("自动流程因灯光指令失败而中止")
+                self._log_issue("灯光指令失败", detail)
         elif kind == "diagnostic":
             self._log_diagnostic(message)
         elif kind == "action_warning":
@@ -2243,6 +2880,8 @@ class SafeControlApp:
             self.arm_var.set("未武装：不会发送移动命令")
             self.walk_mode_var.set("行走模式未准备")
             if kind == "disconnected":
+                self._audio_busy = False
+                self.audio_var.set("已断开；机器狗声音不可用")
                 self._stop_camera()
                 self._set_connection_details_visible(True)
             if kind == "error":
@@ -2258,13 +2897,22 @@ class SafeControlApp:
         self.policy.disarm()
         self.deadman_keys.clear()
         self.click_motion.stop()
+        self._video_recorder.close(timeout=5.0)
         self._person_detection.close()
         self.session.shutdown()
         self.root.destroy()
 
 
 def main() -> None:
-    """创建 Tk 根窗口并进入 GUI 事件循环。"""
+    """先显示品牌欢迎页，再在同一个根窗口中打开控制台。"""
+
+    from .splash import show_splash
+
     root = tk.Tk()
-    SafeControlApp(root)
+    try:
+        show_splash(root, lambda: SafeControlApp(root))
+    except Exception:
+        # 图片资源异常不应阻止控制器启动；主界面的日志能力会在创建后接管。
+        root.overrideredirect(False)
+        SafeControlApp(root)
     root.mainloop()

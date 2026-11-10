@@ -13,8 +13,8 @@ from dataclasses import asdict, dataclass
 # Iterable 表示“可以被 for 遍历的对象”，Mapping 表示类似字典的键值结构。
 from typing import Iterable, Mapping
 
+from .lighting import LIGHT_ACTIONS
 from .safety import Velocity
-
 
 # key 是程序内部稳定名称，value 是界面显示的中文名称。
 ACTION_LABELS = {
@@ -26,6 +26,11 @@ ACTION_LABELS = {
     "hello": "打招呼",
     "stretch": "伸展",
     "heart": "比心",
+    "play_sound": "播放声音",
+    "light_red": "红灯",
+    "light_red_flash": "红灯闪烁",
+    "light_green": "绿灯",
+    "light_white": "白灯",
     "wait": "等待",
     "forward": "前进",
     "backward": "后退",
@@ -36,7 +41,7 @@ ACTION_LABELS = {
     "stop": "停止",
     "stand_down": "安全卧趴",
 }
-# 字典推导式把上面的映射反过来，用中文标签查内部动作名。
+
 LABEL_ACTIONS = {label: action for action, label in ACTION_LABELS.items()}
 # 兼容旧版本保存的流程文件；界面显示新名称，但读取“恢复站立”仍能识别。
 LABEL_ACTIONS["恢复站立"] = "recovery_stand"
@@ -49,6 +54,7 @@ MOTION_ACTIONS = {
     "turn_left",
     "turn_right",
 }
+
 SPORT_ACTIONS = {
     "stand_up",
     "stand_down",
@@ -63,14 +69,13 @@ SPORT_ACTIONS = {
 MAX_STEPS = 30
 MAX_TOTAL_DURATION = 120.0
 
-
 @dataclass(frozen=True)
 class WorkflowStep:
     """一个不可变流程步骤：动作、速度和需要等待的时间。"""
-
     action: str
     speed: float
     duration: float
+    asset_id: str = ""
 
     @property
     def label(self) -> str:
@@ -81,7 +86,6 @@ class WorkflowStep:
     @property
     def moving(self) -> bool:
         """判断此步骤是否会持续发送非零速度。"""
-
         return self.action in MOTION_ACTIONS
 
 
@@ -99,7 +103,6 @@ def default_workflow() -> list[WorkflowStep]:
         WorkflowStep("stand_down", 0.0, 3.0),
     ]
 
-
 def _number(value: object, *, label: str, default: float = 0.0) -> float:
     """把界面输入安全转换为有限浮点数，并生成中文错误信息。"""
 
@@ -116,7 +119,6 @@ def _number(value: object, *, label: str, default: float = 0.0) -> float:
         raise ValueError(f"{label}必须是有限数字。")
     return result
 
-
 def parse_workflow(rows: Iterable[Mapping[str, object]]) -> list[WorkflowStep]:
     """把界面/JSON 的原始数据转换成经过安全校验的步骤列表。"""
 
@@ -124,8 +126,6 @@ def parse_workflow(rows: Iterable[Mapping[str, object]]) -> list[WorkflowStep]:
     items = list(rows)
     if not items:
         raise ValueError("流程至少需要一个步骤。")
-    if len(items) > MAX_STEPS:
-        raise ValueError(f"流程最多允许 {MAX_STEPS} 个步骤。")
 
     steps: list[WorkflowStep] = []
     # enumerate(..., start=1) 同时得到从 1 开始的步骤编号和当前数据。
@@ -138,6 +138,7 @@ def parse_workflow(rows: Iterable[Mapping[str, object]]) -> list[WorkflowStep]:
 
         speed = _number(row.get("speed", ""), label=f"第 {index} 步速度")
         duration = _number(row.get("duration", ""), label=f"第 {index} 步持续时间")
+        asset_id = str(row.get("asset_id", "")).strip()
         label = ACTION_LABELS[action]
 
         if action in MOTION_ACTIONS:
@@ -162,12 +163,27 @@ def parse_workflow(rows: Iterable[Mapping[str, object]]) -> list[WorkflowStep]:
             speed = 0.0
             if not 1.0 <= duration <= 10.0:
                 raise ValueError(f"第 {index} 步{label}等待时间必须在 1.00 到 10.00 秒之间。")
+        elif action == "play_sound":
+            speed = 0.0
+            if len(asset_id) != 64 or any(char not in "0123456789abcdef" for char in asset_id):
+                raise ValueError(f"第 {index} 步请选择声音库中的有效音频。")
+            if not 0.10 <= duration <= 120.0:
+                raise ValueError(f"第 {index} 步声音等待时间必须在 0.10 到 120.00 秒之间。")
+        elif action in LIGHT_ACTIONS:
+            speed = 0.0
+            # VUI 的 time 以整秒计；灯光时长与流程等待时长是两件事。
+            minimum = 2 if action == "light_red_flash" else 1
+            if not minimum <= duration <= 30 or not duration.is_integer():
+                raise ValueError(f"第 {index} 步灯光时长必须是 {minimum} 到 30 的整数秒。")
         else:
             speed = 0.0
             duration = 0.0
 
+        if action != "play_sound":
+            asset_id = ""
+
         # 只有通过本步骤全部校验后，才把它加入最终列表。
-        steps.append(WorkflowStep(action, speed, duration))
+        steps.append(WorkflowStep(action, speed, duration, asset_id))
 
     # 生成器表达式逐个取 duration 求和，限制整套自动流程的总运行时间。
     total = sum(step.duration for step in steps)
@@ -192,14 +208,19 @@ def velocity_for_step(step: WorkflowStep) -> Velocity:
         "turn_right": Velocity(0.0, 0.0, -speed),
     }.get(step.action, Velocity.zero())
 
-
 def workflow_to_json(steps: Iterable[WorkflowStep]) -> str:
     """重新校验步骤，再转换成方便人阅读的 UTF-8 JSON 文本。"""
 
     # asdict(step) 会得到 {"action": ..., "speed": ..., "duration": ...}。
     validated = parse_workflow(asdict(step) for step in steps)
     # ensure_ascii=False 让中文直接保留；indent=2 让文件带有两空格缩进。
-    return json.dumps([asdict(step) for step in validated], ensure_ascii=False, indent=2)
+    rows = []
+    for step in validated:
+        row = asdict(step)
+        if not step.asset_id:
+            del row["asset_id"]  # 旧流程保持原来的三个字段，方便旧版本阅读。
+        rows.append(row)
+    return json.dumps(rows, ensure_ascii=False, indent=2)
 
 
 def workflow_from_json(text: str) -> list[WorkflowStep]:
@@ -274,7 +295,14 @@ class WorkflowRunner:
         if now - self._started_at < step.duration:
             return False
 
-        # 当前步骤到时：索引加一，并让下一步重新等待 begin_current。
+        return self.complete_current()
+
+    def complete_current(self) -> bool:
+        """确认型步骤收到机器人回复后立即前进，不必等灯光自行熄灭。"""
+
+        if self.current_step is None or self._started_at is None:
+            return False
+        # 当前步骤完成：索引加一，并让下一步重新等待 begin_current。
         self._index += 1
         self._started_at = None
         if self._index >= len(self._steps):

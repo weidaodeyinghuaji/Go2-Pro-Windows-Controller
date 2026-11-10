@@ -17,6 +17,9 @@ $PersonModelDirectory = Join-Path $ProjectRoot "models"
 $PersonModelPath = Join-Path $PersonModelDirectory "yolox_tiny.onnx"
 $PersonModelUrl = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_tiny.onnx"
 $PersonModelSha256 = "427CC366D34E27FF7A03E2899B5E3671425C262EA2291F88BB942BC1CC70B0F7"
+$PoseModelPath = Join-Path $PersonModelDirectory "pose_landmarker_lite.task"
+$PoseModelUrl = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+$PoseModelSha256 = "59929E1D1EE95287735DDD833B19CF4AC46D29BC7AFDDBBF6753C459690D574A"
 
 function Test-CompatiblePython([string]$Executable) {
     if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
@@ -91,6 +94,36 @@ function Install-PersonModel {
             throw "Downloaded YOLOX model checksum mismatch."
         }
         Move-Item -LiteralPath $DownloadPath -Destination $PersonModelPath -Force
+    } finally {
+        if (Test-Path -LiteralPath $DownloadPath -PathType Leaf) {
+            Remove-Item -LiteralPath $DownloadPath -Force
+        }
+    }
+}
+
+function Test-PoseModel {
+    if (-not (Test-Path -LiteralPath $PoseModelPath -PathType Leaf)) {
+        return $false
+    }
+    $ActualHash = (Get-FileHash -LiteralPath $PoseModelPath -Algorithm SHA256).Hash
+    return [string]::Equals($ActualHash, $PoseModelSha256, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Install-PoseModel {
+    if (Test-PoseModel) {
+        Write-Host "Standing-pose model is already valid."
+        return
+    }
+    New-Item -ItemType Directory -Path $PersonModelDirectory -Force | Out-Null
+    $DownloadPath = Join-Path $PersonModelDirectory ".pose_landmarker_lite.task.download"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $PoseModelUrl -OutFile $DownloadPath -UseBasicParsing
+        $DownloadedHash = (Get-FileHash -LiteralPath $DownloadPath -Algorithm SHA256).Hash
+        if (-not [string]::Equals($DownloadedHash, $PoseModelSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Downloaded MediaPipe pose model checksum mismatch."
+        }
+        Move-Item -LiteralPath $DownloadPath -Destination $PoseModelPath -Force
     } finally {
         if (Test-Path -LiteralPath $DownloadPath -PathType Leaf) {
             Remove-Item -LiteralPath $DownloadPath -Force
@@ -186,13 +219,14 @@ try {
     Invoke-Checked $VenvPython @("-m", "pip", "install", "-r", (Join-Path $ProjectRoot "requirements-runtime.txt"))
     Invoke-Checked $VenvPython @("-m", "pip", "install", "--no-deps", "-r", (Join-Path $ProjectRoot "requirements.txt"))
 
-    Write-Host "[4/5] Downloading/verifying YOLOX-Tiny person detection model..."
+    Write-Host "[4/5] Downloading/verifying the person detection model..."
     Install-PersonModel
+    Install-PoseModel
 
     Write-Host "[5/5] Verifying imports..."
     Invoke-Checked $VenvPython @(
         "-c",
-        "import tkinter, aiortc, curl_cffi, onnxruntime, sounddevice, unitree_webrtc_connect; from PIL import Image; from Crypto.Cipher import AES; print('Environment verification passed')"
+        "import tkinter, aiortc, curl_cffi, mediapipe, onnxruntime, sounddevice, unitree_webrtc_connect; from PIL import Image; from Crypto.Cipher import AES; print('Environment verification passed')"
     )
 
     Write-Host ""

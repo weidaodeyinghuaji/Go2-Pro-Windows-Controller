@@ -53,7 +53,6 @@ def move_options(velocity: Velocity) -> dict[str, Any]:
         },
     }
 
-
 def stop_options() -> dict[str, int]:
     """生成 StopMove 请求；停止动作没有额外参数。"""
 

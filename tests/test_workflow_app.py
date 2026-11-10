@@ -1,6 +1,8 @@
 import tkinter as tk
 import tempfile
+import os
 import unittest
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -22,6 +24,13 @@ class FakeSession:
         self.stand_up_calls = 0
         self.stand_down_calls = 0
         self.sport_action_calls: list[str] = []
+        self.audio_files: list[Path] = []
+        self.audio_stop_calls = 0
+        self.audio_catalog_ready = True
+        self.synced_audio: set[str] = set()
+        self.play_synced_calls: list[str] = []
+        self.sync_calls: list[object] = []
+        self.light_calls: list[tuple[str, int, str]] = []
 
     def update_velocity(self, velocity: Velocity) -> None:
         self.velocities.append(velocity)
@@ -46,6 +55,24 @@ class FakeSession:
         self.sport_action_calls.append(action)
         self.walk_ready = False
 
+    def play_audio(self, path: Path) -> None:
+        self.audio_files.append(path)
+
+    def stop_audio(self) -> None:
+        self.audio_stop_calls += 1
+
+    def has_synced_audio(self, asset_id: str) -> bool:
+        return asset_id in self.synced_audio
+
+    def play_synced_audio(self, asset_id: str) -> None:
+        self.play_synced_calls.append(asset_id)
+
+    def sync_sounds(self, sounds: object) -> None:
+        self.sync_calls.append(sounds)
+
+    def set_light(self, action: str, seconds: int, request_id: str) -> None:
+        self.light_calls.append((action, seconds, request_id))
+
     def connect(self, _settings: object) -> None:
         pass
 
@@ -66,10 +93,12 @@ class WorkflowAppTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = tk.Tk()
         self.root.withdraw()
-        self.session = FakeSession()
-        with patch("go2_safe_control.app.RobotSession", return_value=self.session):
-            self.app = SafeControlApp(self.root)
         self.log_directory = tempfile.TemporaryDirectory()
+        self.session = FakeSession()
+        with patch.dict(os.environ, {"LOCALAPPDATA": self.log_directory.name}), patch(
+            "go2_safe_control.app.RobotSession", return_value=self.session
+        ):
+            self.app = SafeControlApp(self.root)
         self.app._error_log_path = Path(self.log_directory.name) / "error.log"
         self.app.input_guard.activate = Mock()
         self.app.input_guard.deactivate = Mock()
@@ -78,6 +107,140 @@ class WorkflowAppTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.root.destroy()
         self.log_directory.cleanup()
+
+    def test_audio_buttons_play_stop_and_log_errors_without_popup(self) -> None:
+        source = Path(self.log_directory.name) / "sound.wav"
+        with wave.open(str(source), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(44100)
+            output.writeframes(bytes(4410 * 2))
+        with patch("go2_safe_control.app.filedialog.askopenfilename", return_value=str(source)):
+            self.app._choose_audio()
+        self.assertEqual(self.app._audio_file.suffix, ".wav")
+        self.session.synced_audio.add(self.app._selected_audio_id)
+        self.app._play_audio()
+        self.assertEqual(self.session.play_synced_calls, [self.app._selected_audio_id])
+        self.assertTrue(self.app._audio_busy)
+        self.app._stop_audio()
+        self.assertEqual(self.session.audio_stop_calls, 1)
+        with patch("go2_safe_control.app.messagebox.showerror") as popup:
+            self.app._handle_session_event("audio_error", "机器人拒绝播放")
+            popup.assert_not_called()
+        self.assertFalse(self.app._audio_busy)
+        self.assertIn("机器人拒绝播放", self.app._error_log_path.read_text(encoding="utf-8"))
+
+    def test_sound_workflow_requires_prior_sync_and_never_uploads_while_running(self) -> None:
+        sound = self.app.sound_library.list_sounds()[0]
+        self.app.workflow_steps = [
+            WorkflowStep("play_sound", 0.0, 1.0, sound.asset_id),
+            WorkflowStep("wait", 0.0, 0.1),
+        ]
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+        self.assertFalse(self.app.workflow_runner.running)
+        self.assertIn("同步", self.app._error_log_path.read_text(encoding="utf-8"))
+        self.session.synced_audio.add(sound.asset_id)
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+        self.assertTrue(self.app.workflow_runner.running)
+        self.app._workflow_velocity(now=10.0, focused=True)
+        self.assertEqual(self.session.play_synced_calls, [sound.asset_id])
+        self.assertEqual(self.session.sync_calls, [])
+        self.assertTrue(self.app._workflow_audio_pending)
+        self.app._workflow_velocity(now=100.0, focused=True)
+        self.assertEqual(self.app.workflow_runner.current_index, 0)
+        with patch("go2_safe_control.app.time.monotonic", return_value=10.2):
+            self.app._handle_session_event("audio_started", sound.asset_id)
+        self.assertFalse(self.app._workflow_audio_pending)
+        self.app._workflow_velocity(now=11.3, focused=True)
+        self.assertEqual(self.app.workflow_runner.current_step.action, "wait")
+        self.assertGreaterEqual(self.session.audio_stop_calls, 1)
+
+    def test_sound_workflow_play_error_cancels_without_popup(self) -> None:
+        sound = self.app.sound_library.list_sounds()[0]
+        self.session.synced_audio.add(sound.asset_id)
+        self.app.workflow_steps = [WorkflowStep("play_sound", 0.0, 1.0, sound.asset_id)]
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+        self.app._workflow_velocity(now=10.0, focused=True)
+        with patch("go2_safe_control.app.messagebox.showerror") as popup:
+            self.app._handle_session_event("audio_error", "播放被机器人拒绝")
+            popup.assert_not_called()
+        self.assertFalse(self.app.workflow_runner.running)
+        self.assertIn("播放被机器人拒绝", self.app._error_log_path.read_text(encoding="utf-8"))
+
+    def test_red_light_then_existing_local_sound_are_independent_steps(self) -> None:
+        sound = self.app.sound_library.list_sounds()[0]
+        self.session.synced_audio.add(sound.asset_id)
+        self.app.workflow_steps = [
+            WorkflowStep("light_red_flash", 0.0, 8.0),
+            WorkflowStep("play_sound", 0.0, max(1.0, sound.duration + 0.3), sound.asset_id),
+        ]
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+        self.app._workflow_velocity(now=10.0, focused=True)
+        self.assertEqual(len(self.session.light_calls), 1)
+        self.assertEqual(self.session.light_calls[0][:2], ("light_red_flash", 8))
+        self.assertEqual(self.session.play_synced_calls, [])
+        request_id = self.session.light_calls[0][2]
+        with patch("go2_safe_control.app.time.monotonic", return_value=10.1):
+            self.app._handle_session_event("light_started", request_id)
+        self.assertEqual(self.app.workflow_runner.current_step.action, "play_sound")
+        self.app._workflow_velocity(now=10.4, focused=True)
+        self.assertEqual(self.session.play_synced_calls, [sound.asset_id])
+
+    def test_failed_light_cancels_workflow_without_starting_sound(self) -> None:
+        self.app.workflow_steps = [
+            WorkflowStep("light_red", 0.0, 5.0), WorkflowStep("wait", 0.0, 1.0)
+        ]
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+        self.app._workflow_velocity(now=10.0, focused=True)
+        request_id = self.session.light_calls[0][2]
+        self.app._handle_session_event("light_error", request_id + "|机器人拒绝灯光指令")
+        self.assertFalse(self.app.workflow_runner.running)
+        self.assertIn("机器人拒绝灯光指令", self.app._error_log_path.read_text(encoding="utf-8"))
+
+    def test_light_reply_timeout_stops_waiting_instead_of_hanging(self) -> None:
+        self.app.workflow_steps = [WorkflowStep("light_green", 0.0, 3.0)]
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+        self.app._workflow_velocity(now=10.0, focused=True)
+        self.app._workflow_velocity(now=16.0, focused=True)
+        self.assertFalse(self.app.workflow_runner.running)
+        self.assertIn("灯光确认超时", self.app._error_log_path.read_text(encoding="utf-8"))
+
+    def test_popdown_style_heartbeat_failure_logs_call_stack_and_current_step(self) -> None:
+        self.app.workflow_steps = [WorkflowStep("wait", 0.0, 5.0)]
+        with patch.object(self.app, "_ask_confirmation", return_value=True):
+            self.app._start_workflow()
+
+        def raise_popdown() -> None:
+            raise KeyError("popdown")
+
+        with patch.object(self.app, "_sync_control_states", side_effect=raise_popdown), patch.object(
+            self.app.root, "after"
+        ):
+            self.app._tick()
+
+        self.assertFalse(self.app.workflow_runner.running)
+        logged = self.app._error_log_path.read_text(encoding="utf-8")
+        self.assertIn("raise_popdown", logged)
+        self.assertIn("第 1 步", logged)
+
+    def test_sound_workflow_save_includes_portable_audio_asset(self) -> None:
+        sound = self.app.sound_library.list_sounds()[0]
+        self.app.workflow_steps = [WorkflowStep("play_sound", 0.0, 1.0, sound.asset_id)]
+        target = Path(self.log_directory.name) / "my_flow.json"
+        with patch("go2_safe_control.app.filedialog.asksaveasfilename", return_value=str(target)):
+            self.app._save_workflow()
+        self.assertTrue(target.is_file())
+        self.assertTrue((target.with_name("my_flow_声音素材") / f"{sound.asset_id}.wav").is_file())
+        self.app.workflow_steps = [WorkflowStep("wait", 0.0, 1.0)]
+        with patch("go2_safe_control.app.filedialog.askopenfilename", return_value=str(target)):
+            self.app._load_workflow()
+        self.assertEqual(self.app.workflow_steps[0].asset_id, sound.asset_id)
 
     def test_ui_disables_motion_until_connected_confirmed_and_armed(self) -> None:
         self.app.policy.disarm()
@@ -114,56 +277,73 @@ class WorkflowAppTests(unittest.TestCase):
         self.assertIn("红色框", self.app.camera_var.get())
         self.assertNotIn("正在", self.app.camera_var.get())
 
-    def test_refresh_shortcut_defaults_to_f5_and_is_visible(self) -> None:
-        self.assertEqual(self.app.person_refresh_shortcut_var.get(), "F5")
-        self.assertEqual(
-            tuple(self.app.person_refresh_shortcut_box.cget("values")),
-            ("F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"),
-        )
+    def test_refresh_shortcut_is_fixed_to_f5_without_a_selector(self) -> None:
+        self.assertFalse(hasattr(self.app, "person_refresh_shortcut_var"))
+        self.assertFalse(hasattr(self.app, "person_refresh_shortcut_box"))
         self.assertIn("F5", self.app.person_refresh_button.cget("text"))
 
     def test_refresh_shortcut_toggles_box_color_once_per_key_press(self) -> None:
         self.app._camera_requested = True
-        self.app._person_detection.refresh = Mock()
+        self.app._person_detection.clear = Mock()
         event = SimpleNamespace(keysym="F5", keycode=116)
 
         self.assertEqual(self.app._on_key_press(event), "break")
         self.assertEqual(self.app._person_box_color, PERSON_BOX_RED)
         self.assertEqual(self.app._on_key_press(event), "break")
         self.assertEqual(self.app._person_box_color, PERSON_BOX_RED)
-        self.app._person_detection.refresh.assert_called_once_with()
+        self.app._person_detection.clear.assert_called_once_with()
 
         self.assertEqual(self.app._on_key_release(event), "break")
         self.assertEqual(self.app._on_key_press(event), "break")
         self.assertEqual(self.app._person_box_color, PERSON_BOX_GREEN)
-        self.assertEqual(self.app._person_detection.refresh.call_count, 2)
-
-    def test_changing_refresh_shortcut_updates_button_and_key(self) -> None:
-        self.app._camera_requested = True
-        self.app._person_detection.refresh = Mock()
-        self.app.person_refresh_shortcut_var.set("F8")
-        self.app._on_refresh_shortcut_changed()
-
-        self.assertIn("F8", self.app.person_refresh_button.cget("text"))
-        self.assertIsNone(
-            self.app._on_key_press(SimpleNamespace(keysym="F5", keycode=116))
-        )
-        self.assertEqual(
-            self.app._on_key_press(SimpleNamespace(keysym="F8", keycode=119)),
-            "break",
-        )
-        self.app._person_detection.refresh.assert_called_once_with()
+        self.assertEqual(self.app._person_detection.clear.call_count, 2)
 
     def test_refresh_shortcut_cannot_bypass_camera_requirement(self) -> None:
         self.app._camera_requested = False
-        self.app._person_detection.refresh = Mock()
+        self.app._person_detection.clear = Mock()
 
         result = self.app._on_key_press(SimpleNamespace(keysym="F5", keycode=116))
 
         self.assertEqual(result, "break")
         self.assertEqual(self.app._person_box_color, PERSON_BOX_GREEN)
-        self.app._person_detection.refresh.assert_not_called()
+        self.app._person_detection.clear.assert_not_called()
         self.assertIn("请先连接并开启摄像头", self.app.camera_var.get())
+
+    def test_record_shortcut_starts_and_stops_once_per_key_press(self) -> None:
+        self.app._camera_requested = True
+        self.app._start_recording = Mock()
+        self.app._stop_recording = Mock()
+        self.app._video_recorder.is_recording = False
+        event = SimpleNamespace(keysym="r", keycode=82, state=0x0004)
+
+        self.assertEqual(self.app._on_key_press(event), "break")
+        self.assertEqual(self.app._on_key_press(event), "break")
+        self.app._start_recording.assert_called_once_with()
+
+        self.assertEqual(self.app._on_key_release(event), "break")
+        self.app._video_recorder.is_recording = True
+        self.assertEqual(self.app._on_key_press(event), "break")
+        self.app._stop_recording.assert_called_once_with()
+
+    def test_record_shortcut_cannot_bypass_camera_requirement(self) -> None:
+        self.app._camera_requested = False
+        self.app._start_recording = Mock()
+        event = SimpleNamespace(keysym="r", keycode=82, state=0x0004)
+
+        self.assertEqual(self.app._on_key_press(event), "break")
+
+        self.app._start_recording.assert_not_called()
+        self.assertIn("请先连接并开启摄像头", self.app.recording_var.get())
+
+    def test_canceling_record_dialog_releases_shortcut_latch(self) -> None:
+        self.app._camera_requested = True
+        self.app._record_shortcut_down = True
+
+        with patch("go2_safe_control.app.filedialog.asksaveasfilename", return_value=""):
+            self.app._start_recording()
+
+        self.assertFalse(self.app._record_shortcut_down)
+        self.assertIn("已取消录制", self.app.recording_var.get())
 
     def test_wait_only_workflow_completes_and_stops(self) -> None:
         self.app.workflow_steps = [WorkflowStep("wait", 0.0, 0.1)]

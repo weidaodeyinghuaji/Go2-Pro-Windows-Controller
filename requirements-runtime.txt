@@ -1,6 +1,8 @@
 aiortc>=1.9.0
+av>=14,<19
 curl_cffi
 lz4
+mediapipe==1.0.1
 numpy
 onnxruntime==1.28.0
 packaging

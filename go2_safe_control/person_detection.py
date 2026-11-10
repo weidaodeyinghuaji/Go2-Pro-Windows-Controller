@@ -23,14 +23,24 @@ YOLOX_INPUT_SIZE = (416, 416)
 PERSON_CLASS_INDEX = 0
 PERSON_BOX_GREEN = "#00C853"
 PERSON_BOX_RED = "#D00000"
-DEFAULT_CONFIDENCE = 0.45
+DEFAULT_CONFIDENCE = 0.30
 DEFAULT_NMS_THRESHOLD = 0.45
+POSE_INPUT_SIZE = 256
+POSE_VISIBILITY_THRESHOLD = 0.35
+MIN_STANDING_HIP_ANGLE = 145.0
+MIN_STANDING_KNEE_ANGLE = 150.0
 
 
 def default_model_path() -> Path:
     """返回通用安装器下载的固定 YOLOX-Tiny ONNX 模型位置。"""
 
     return Path(__file__).resolve().parents[1] / "models" / "yolox_tiny.onnx"
+
+
+def default_pose_model_path() -> Path:
+    """返回用于区分站姿和坐姿的 MediaPipe 姿态模型位置。"""
+
+    return Path(__file__).resolve().parents[1] / "models" / "pose_landmarker_lite.task"
 
 
 @dataclass(frozen=True)
@@ -56,6 +66,12 @@ class PersonDetector(Protocol):
     """后台工作线程所需的最小模型接口，测试时可以替换成假模型。"""
 
     def detect(self, frame: VideoFrameData) -> tuple[PersonBox, ...]: ...
+
+
+class PoseClassifier(Protocol):
+    """判断一个 YOLOX 人框中是否为明确站立姿态。"""
+
+    def is_standing(self, frame: VideoFrameData, box: PersonBox) -> bool: ...
 
 
 DetectorFactory = Callable[[Path], PersonDetector]
@@ -140,7 +156,7 @@ def person_boxes_from_yolox(
     nms_threshold: float = DEFAULT_NMS_THRESHOLD,
     already_decoded: bool = False,
 ) -> tuple[PersonBox, ...]:
-    """从 YOLOX 输出中只提取 COCO 的 ``person``（类别 0）。"""
+    """从 YOLOX 输出中提取 COCO ``person`` 候选框。"""
 
     if scale <= 0 or frame_width <= 0 or frame_height <= 0:
         raise ValueError("人员识别的画面尺寸或缩放比例无效")
@@ -187,7 +203,7 @@ def person_boxes_from_yolox(
 
 
 def _prepare_yolox_input(frame: VideoFrameData) -> tuple[np.ndarray, float]:
-    """把 480×270 RGB 帧按官方 YOLOX 方式缩放并填充到 416×416。"""
+    """把原比例 RGB 帧按官方 YOLOX 方式缩放并填充到 416×416。"""
 
     try:
         from PIL import Image
@@ -208,7 +224,7 @@ def _prepare_yolox_input(frame: VideoFrameData) -> tuple[np.ndarray, float]:
 
 
 class OnnxYoloxPersonDetector:
-    """使用 CPU 版 ONNX Runtime 执行 YOLOX-Tiny 人员识别。"""
+    """使用 CPU 版 ONNX Runtime 找出画面中的人员候选框。"""
 
     def __init__(self, model_path: Path) -> None:
         if not model_path.is_file():
@@ -242,6 +258,19 @@ class OnnxYoloxPersonDetector:
             frame_width=frame.width,
             frame_height=frame.height,
         )
+
+
+def split_person_boxes_by_color(
+    boxes: tuple[PersonBox, ...],
+    color: str,
+) -> tuple[tuple[PersonBox, ...], tuple[PersonBox, ...]]:
+    """返回需要绘制的绿框和红框；红色模式只保留最高置信度目标。"""
+
+    if color != PERSON_BOX_RED or not boxes:
+        return boxes, tuple()
+    highest_index = max(range(len(boxes)), key=lambda index: boxes[index].confidence)
+    red_boxes = (boxes[highest_index],)
+    return tuple(), red_boxes
 
 
 def draw_person_boxes(
@@ -279,6 +308,156 @@ def draw_person_boxes(
     return VideoFrameData(frame.width, frame.height, image.tobytes())
 
 
+def _joint_angle(first: np.ndarray, middle: np.ndarray, last: np.ndarray) -> float:
+    """计算三个二维关键点形成的夹角，返回 0~180 度。"""
+
+    vector_a = first[:2] - middle[:2]
+    vector_b = last[:2] - middle[:2]
+    denominator = float(np.linalg.norm(vector_a) * np.linalg.norm(vector_b))
+    if denominator <= 1e-8:
+        return 0.0
+    cosine = float(np.clip(np.dot(vector_a, vector_b) / denominator, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def is_standing_pose(landmarks: np.ndarray) -> bool:
+    """仅接受双腿伸直、躯干直立且关键点完整的明确站姿。"""
+
+    points = np.asarray(landmarks, dtype=np.float32)
+    if points.shape != (33, 3):
+        return False
+    for shoulder_index, hip_index, knee_index, ankle_index in (
+        (11, 23, 25, 27),
+        (12, 24, 26, 28),
+    ):
+        shoulder = points[shoulder_index]
+        hip = points[hip_index]
+        knee = points[knee_index]
+        ankle = points[ankle_index]
+        if np.any(
+            points[[shoulder_index, hip_index, knee_index, ankle_index], 2]
+            < POSE_VISIBILITY_THRESHOLD
+        ):
+            continue
+        if not (shoulder[1] < hip[1] < knee[1] < ankle[1]):
+            continue
+        hip_angle = _joint_angle(shoulder, hip, knee)
+        knee_angle = _joint_angle(hip, knee, ankle)
+        if hip_angle >= MIN_STANDING_HIP_ANGLE and knee_angle >= MIN_STANDING_KNEE_ANGLE:
+            return True
+    return False
+
+
+class MediaPipePoseClassifier:
+    """用 MediaPipe 的 33 个身体关键点严格复核站立姿态。"""
+
+    def __init__(self, model_path: str | Path | None = None) -> None:
+        path = Path(model_path) if model_path is not None else default_pose_model_path()
+        if not path.is_file():
+            raise FileNotFoundError(f"缺少站姿识别模型：{path}")
+        try:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except ImportError as exc:
+            raise RuntimeError(f"MediaPipe 加载失败：{exc}") from exc
+
+        options = vision.PoseLandmarkerOptions(
+            # MediaPipe 的原生库在某些 Windows 中文路径下无法按文件名打开模型；
+            # 由 Python 读取字节后传入，免安装版放在任意目录也能加载。
+            base_options=mp_python.BaseOptions(model_asset_buffer=path.read_bytes()),
+            running_mode=vision.RunningMode.IMAGE,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+        )
+        self._mp = mp
+        self._landmarker = vision.PoseLandmarker.create_from_options(options)
+
+    def is_standing(self, frame: VideoFrameData, box: PersonBox) -> bool:
+        from PIL import Image
+
+        image = np.frombuffer(frame.rgb, dtype=np.uint8).reshape(
+            (frame.height, frame.width, 3)
+        )
+        padding_x = max(8, int((box.x2 - box.x1) * 0.15))
+        padding_y = max(8, int((box.y2 - box.y1) * 0.10))
+        x1 = max(0, box.x1 - padding_x)
+        y1 = max(0, box.y1 - padding_y)
+        x2 = min(frame.width, box.x2 + padding_x)
+        y2 = min(frame.height, box.y2 + padding_y)
+        crop = np.ascontiguousarray(image[y1:y2, x1:x2])
+        if crop.size == 0:
+            return False
+
+        crop_height, crop_width = crop.shape[:2]
+        square_size = max(crop_height, crop_width)
+        square = np.full((square_size, square_size, 3), 114, dtype=np.uint8)
+        top = (square_size - crop_height) // 2
+        left = (square_size - crop_width) // 2
+        square[top : top + crop_height, left : left + crop_width] = crop
+        crop = np.asarray(
+            Image.fromarray(square).resize(
+                (POSE_INPUT_SIZE, POSE_INPUT_SIZE),
+                Image.Resampling.BILINEAR,
+            )
+        )
+        crop = np.ascontiguousarray(crop)
+
+        mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=crop)
+        result = self._landmarker.detect(mp_image)
+        if not result.pose_landmarks:
+            return False
+        pose = result.pose_landmarks[0]
+        landmarks = np.array(
+            [
+                (
+                    landmark.x,
+                    landmark.y,
+                    min(float(landmark.visibility), float(landmark.presence)),
+                )
+                for landmark in pose
+            ],
+            dtype=np.float32,
+        )
+        return is_standing_pose(landmarks)
+
+    def close(self) -> None:
+        self._landmarker.close()
+
+
+class StandingPersonDetector:
+    """YOLOX 负责找人，MediaPipe 负责过滤坐姿并保留全部站立人员。"""
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        *,
+        candidate_detector: PersonDetector | None = None,
+        pose_classifier: PoseClassifier | None = None,
+    ) -> None:
+        self._candidate_detector = candidate_detector or OnnxYoloxPersonDetector(model_path)
+        self._pose_classifier = pose_classifier or MediaPipePoseClassifier()
+        self.last_candidate_count = 0
+
+    def detect(self, frame: VideoFrameData) -> tuple[PersonBox, ...]:
+        candidates = sorted(
+            self._candidate_detector.detect(frame),
+            key=lambda box: box.confidence,
+            reverse=True,
+        )
+        self.last_candidate_count = len(candidates)
+        return tuple(
+            box for box in candidates if self._pose_classifier.is_standing(frame, box)
+        )
+
+    def close(self) -> None:
+        for component in (self._pose_classifier, self._candidate_detector):
+            close = getattr(component, "close", None)
+            if callable(close):
+                close()
+
+
 class PersonDetectionWorker:
     """只处理最新帧的后台识别线程，避免慢电脑积压视频。"""
 
@@ -286,7 +465,7 @@ class PersonDetectionWorker:
         self,
         model_path: str | Path,
         *,
-        detector_factory: DetectorFactory = OnnxYoloxPersonDetector,
+        detector_factory: DetectorFactory = StandingPersonDetector,
         status_callback: StatusCallback | None = None,
         min_interval: float = 0.10,
     ) -> None:
@@ -373,6 +552,7 @@ class PersonDetectionWorker:
         detector_generation = -1
         failed_generation: int | None = None
         last_finished_at = 0.0
+        last_report_at = 0.0
         while True:
             with self._condition:
                 self._condition.wait_for(
@@ -381,6 +561,7 @@ class PersonDetectionWorker:
                     or detector_generation != self._generation
                 )
                 if self._stopped:
+                    self._close_detector(detector)
                     return
                 generation = self._generation
                 frame = self._latest_frame
@@ -390,6 +571,8 @@ class PersonDetectionWorker:
             if failed_generation == generation:
                 continue
             if detector is None or detector_generation != generation:
+                self._close_detector(detector)
+                detector = None
                 self._emit("loading", "正在加载人员识别模型……")
                 try:
                     detector = self._detector_factory(self._model_path)
@@ -408,16 +591,39 @@ class PersonDetectionWorker:
             remaining = self._min_interval - (time.monotonic() - last_finished_at)
             if remaining > 0:
                 time.sleep(remaining)
+            started_at = time.monotonic()
             try:
                 boxes = detector.detect(frame)
             except Exception as exc:
                 self._emit("error", f"{type(exc).__name__}: {exc}")
+                self._close_detector(detector)
                 detector = None
                 failed_generation = generation
                 continue
             finished_at = time.monotonic()
             last_finished_at = finished_at
+            report_message: str | None = None
             with self._condition:
                 # 刷新发生在推理过程中时，旧模型结果不能重新出现在画面上。
                 if generation == self._generation and not self._stopped:
                     self._snapshot = DetectionSnapshot(boxes, finished_at)
+                    if finished_at - last_report_at >= 10.0:
+                        last_report_at = finished_at
+                        candidate_count = getattr(detector, "last_candidate_count", len(boxes))
+                        report_message = (
+                            f"帧 {frame.width}x{frame.height}，YOLO 候选 {candidate_count}，"
+                            f"站姿通过 {len(boxes)}，推理 {finished_at - started_at:.3f}s"
+                        )
+            if report_message is not None:
+                self._emit("diagnostic", report_message)
+
+    @staticmethod
+    def _close_detector(detector: PersonDetector | None) -> None:
+        if detector is None:
+            return
+        close = getattr(detector, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass

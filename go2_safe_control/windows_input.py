@@ -11,6 +11,7 @@ import ctypes
 # os.name 用来判断当前是不是 Windows，避免其他系统误调用 Win32 API。
 import os
 # wintypes 提供 HWND、HANDLE、DWORD 等与 Windows C 接口匹配的类型。
+
 from ctypes import wintypes
 
 
@@ -18,7 +19,6 @@ class WindowsControlInputGuard:
     """只在控制器窗口武装期间临时管理 Windows IME。"""
 
     # 这是 Windows API 规定的标志位，表示加载键盘布局后立即激活它。
-    KLF_ACTIVATE = 0x00000001
 
     def __init__(self) -> None:
         # 下划线开头表示“类内部使用”，调用者通常不应直接修改。

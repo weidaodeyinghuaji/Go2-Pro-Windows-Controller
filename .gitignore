@@ -14,3 +14,5 @@ __pycache__/
 dist/
 build/
 *.zip
+# 旧版 COCO 自检图片保留在本地；发布使用许可明确的 CC0 素材。
+tests/fixtures/standing_person.jpg
